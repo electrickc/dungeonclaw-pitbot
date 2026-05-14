@@ -1,0 +1,25 @@
+{
+  "name": "dungeonclaw-pitbot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DLMM bid-wall accumulator for DCLAW/WETH on SectorOne Base. TEE-deployed.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
