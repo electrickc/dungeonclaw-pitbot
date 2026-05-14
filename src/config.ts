@@ -13,6 +13,15 @@ function loadSecret(name: string): string {
   throw new Error(`Missing secret: ${name} (set ${name} or ${name}_FILE)`)
 }
 
+function loadSecretOpt(name: string): string | undefined {
+  const filePath = process.env[`${name}_FILE`]
+  if (filePath && fs.existsSync(filePath)) {
+    return fs.readFileSync(filePath, 'utf8').trim()
+  }
+  const direct = process.env[name]
+  return direct ? direct.trim() : undefined
+}
+
 function req(name: string): string {
   const v = process.env[name]
   if (!v) throw new Error(`Missing env: ${name}`)
@@ -40,6 +49,8 @@ export const config = {
   privateKey: loadSecret('BOT_PRIVATE_KEY'),
   drpcKey: loadSecret('DRPC_BASE_KEY'),
   adminHmac: loadSecret('ADMIN_WEBHOOK_HMAC'),
+  // Optional: only needed if admin app is behind Vercel Deployment Protection.
+  vercelBypassSecret: loadSecretOpt('VERCEL_BYPASS_SECRET'),
 
   adminWebhookUrl: req('ADMIN_WEBHOOK_URL'),
 

@@ -28,14 +28,26 @@ function sign(body: string, secret: string): string {
 export async function emit(event: PitbotEvent): Promise<void> {
   const body = JSON.stringify(event)
   const sig = sign(body, config.adminHmac)
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Pitbot-Signature': sig,
+    'X-Pitbot-Timestamp': String(event.ts),
+  }
+  // If the admin app is behind Vercel's Deployment Protection, this header
+  // tells Vercel to skip its auth wall and let our request reach Next.js.
+  // The secret is generated in Vercel → Project Settings → Deployment
+  // Protection → "Protection Bypass for Automation". Without this header
+  // every POST gets a Vercel 401 before our route ever runs.
+  if (config.vercelBypassSecret) {
+    headers['x-vercel-protection-bypass'] = config.vercelBypassSecret
+    // This tells Vercel to also set a session cookie so subsequent same-IP
+    // requests don't re-evaluate the bypass. Optional but cheap.
+    headers['x-vercel-set-bypass-cookie'] = 'samesitenone'
+  }
   try {
     const res = await fetch(config.adminWebhookUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Pitbot-Signature': sig,
-        'X-Pitbot-Timestamp': String(event.ts),
-      },
+      headers,
       body,
     })
     if (!res.ok) {
