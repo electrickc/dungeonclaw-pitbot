@@ -237,6 +237,16 @@ async function main(): Promise<void> {
   }
 }
 
+// Belt and braces: capture unhandled promise rejections and uncaught exceptions
+// so they go to stdout (visible in `docker logs`) instead of silently killing
+// the process. The bot can survive most issues; we'd rather see what broke.
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason)
+})
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err)
+})
+
 main().catch((err) => {
   console.error('[fatal]', err)
   process.exit(1)
