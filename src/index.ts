@@ -140,9 +140,17 @@ async function tick(): Promise<void> {
   const snap = await snapshot()
   tracker.push(snap.activeId, snap.timestamp)
 
-  // Detect whether any of our wall bins have already been "consumed" by sells.
-  // A bin below the current active that we held: if its X reserve is non-zero,
-  // it has accumulated DCLAW = we got filled there.
+  // Detect whether any of our wall bins have been "consumed" by sells.
+  //
+  // In LB v2.0: bins BELOW active hold quote token (WETH, our deposit), bins
+  // ABOVE active hold base token (DCLAW). When a sell drives the active bin
+  // down through our wall, the bins it crosses get their WETH swapped out for
+  // DCLAW — those bins are now ABOVE the new active and hold DCLAW.
+  //
+  // So a bin is "filled" iff its id > current activeId. (Previous version had
+  // the comparison reversed — every wall bin below active fired as "filled",
+  // which is the NORMAL post-place state. Bug only surfaced in live mode
+  // because dry-run holds no real LB shares to enumerate.)
   let anyBinFilled = false
   if (state.wallCenterBin !== null) {
     const positions = await walletBinPositions(
@@ -151,7 +159,7 @@ async function tick(): Promise<void> {
       Math.max(8, config.wallBinCount + 4),
     )
     for (const p of positions) {
-      if (p.id < snap.activeId) {
+      if (p.id > snap.activeId) {
         anyBinFilled = true
         break
       }
