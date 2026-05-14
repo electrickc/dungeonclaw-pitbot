@@ -54,15 +54,22 @@ export function binToPrice(binId: number, binStep: number): number {
 
 // Find which of our LB token IDs (bin shares) the wallet currently holds.
 // Returns the IDs and amounts for a range of bin IDs (sliding window).
+//
+// Uses ERC-1155 balanceOfBatch — a SINGLE RPC call returns balances for all
+// 2*radius+1 bins at once. Previously this fired N parallel balanceOf calls
+// (up to 65 with default radius), which routinely tripped dRPC rate limits.
 export async function walletBinPositions(
   addr: string,
   centerBin: number,
   radius = 32,
 ): Promise<{ id: number; shares: bigint }[]> {
   const ids: number[] = []
-  for (let i = -radius; i <= radius; i++) ids.push(centerBin + i)
-  const calls = ids.map((id) => pool.balanceOf(addr, id) as Promise<bigint>)
-  const results = await Promise.all(calls)
+  const accounts: string[] = []
+  for (let i = -radius; i <= radius; i++) {
+    ids.push(centerBin + i)
+    accounts.push(addr)
+  }
+  const results = (await pool.balanceOfBatch(accounts, ids)) as bigint[]
   return ids
     .map((id, i) => ({ id, shares: results[i] }))
     .filter((p) => p.shares > 0n)

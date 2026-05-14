@@ -8,6 +8,7 @@ export const LB_PAIR_ABI = [
   'function tokenX() view returns (address)',
   'function tokenY() view returns (address)',
   'function balanceOf(address account, uint256 id) view returns (uint256)',
+  'function balanceOfBatch(address[] accounts, uint256[] ids) view returns (uint256[])',
   'function totalSupply(uint256 id) view returns (uint256)',
   // Low-level: caller must transfer tokenX/tokenY to the pair BEFORE calling mint.
   // distributionX/Y are in 1e18-scaled fractions per bin (must sum to 1e18 each).

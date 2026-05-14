@@ -193,6 +193,29 @@ async function tick(): Promise<void> {
   }
 }
 
+// Retry helper for startup RPC reads. Transient dRPC failures (load-balancer
+// flips, brief 429s, websocket reconnects) used to kill the container before
+// the main loop ever started, triggering Docker's restart-loop. Now we retry
+// up to 5 times with exponential backoff before giving up.
+async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 5): Promise<T> {
+  let lastErr: unknown
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      const delayMs = Math.min(1000 * 2 ** i, 15000)
+      console.warn(
+        `[boot] ${label} attempt ${i + 1}/${attempts} failed:`,
+        err instanceof Error ? err.message : err,
+        `— retrying in ${delayMs}ms`,
+      )
+      await new Promise((r) => setTimeout(r, delayMs))
+    }
+  }
+  throw lastErr
+}
+
 async function main(): Promise<void> {
   console.log(`[boot] pitbot v0.1.0`)
   console.log(`[boot] wallet=${wallet.address}`)
@@ -201,14 +224,16 @@ async function main(): Promise<void> {
     `[boot] strategy: ${config.skew} skew, ${config.wallBinCount} bins, offset ${config.binOffsetFromActive}, budget ${config.totalWethBudget} WETH`,
   )
 
-  const bal = await balances(wallet.address)
+  const bal = await withRetry('balances', () => balances(wallet.address))
   console.log(
     `[boot] balances: ETH=${ethers.formatEther(bal.eth)} WETH=${ethers.formatEther(bal.weth)} DCLAW=${ethers.formatEther(bal.dclaw)}`,
   )
 
-  await reconstructWallFromChain()
+  await withRetry('reconstructWallFromChain', reconstructWallFromChain)
 
-  await emit({
+  // Webhook is best-effort; never block boot on it. If admin is down the bot
+  // still ticks; once admin recovers it'll see ticks but might miss the boot.
+  emit({
     type: 'boot',
     ts: Math.floor(Date.now() / 1000),
     raw: {
@@ -219,7 +244,7 @@ async function main(): Promise<void> {
       dclaw: bal.dclaw.toString(),
       wallCenterBin: state.wallCenterBin,
     },
-  })
+  }).catch(() => {})
 
   // Main loop. Top-level catch so one bad tick doesn't kill the bot.
   for (;;) {
