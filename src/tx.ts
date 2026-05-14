@@ -72,14 +72,40 @@ export async function mintWall(plan: WallPlan): Promise<TxResult> {
 
 // Withdraw all shares we hold across the given bins. amounts = total LB tokens
 // per bin to burn (typically the entire wallet balance for each).
+// LB v2.0 burn is a TWO-step process, symmetric with the mint flow:
+//   1. transfer LB shares from wallet to pair (safeBatchTransferFrom)
+//   2. call burn — pair burns ITS OWN balance (received from step 1) and
+//      sends X/Y to recipient
+//
+// Calling burn directly without step 1 reverts inside the pair because
+// address(this) has 0 shares to burn. The bot used to skip step 1, which is
+// why withdraw attempts triggered "execution reverted (unknown custom
+// error)" on estimateGas (the custom selector decodes to an
+// "insufficient liquidity to burn" style error from the pair).
 export async function burnWall(
   binIds: number[],
   shares: bigint[],
 ): Promise<TxResult> {
   if (binIds.length !== shares.length) throw new Error('burn arrays mismatched')
   const ids = binIds.map((b) => BigInt(b))
-  const data = pool.interface.encodeFunctionData('burn', [ids, shares, wallet.address])
-  return send('burnWall', { to: config.poolAddress, data, value: 0n })
+
+  // Step 1: deposit the LB shares into the pair
+  const transferData = pool.interface.encodeFunctionData('safeBatchTransferFrom', [
+    wallet.address,
+    config.poolAddress,
+    ids,
+    shares,
+    '0x',
+  ])
+  await send('transferLBSharesToPool', {
+    to: config.poolAddress,
+    data: transferData,
+    value: 0n,
+  })
+
+  // Step 2: pair burns its own balance, releases X+Y to recipient
+  const burnData = pool.interface.encodeFunctionData('burn', [ids, shares, wallet.address])
+  return send('burnWall', { to: config.poolAddress, data: burnData, value: 0n })
 }
 
 export async function wethBalance(): Promise<bigint> {
