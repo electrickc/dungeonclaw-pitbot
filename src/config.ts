@@ -67,11 +67,12 @@ export const config = {
   rebalanceCooldownSeconds: num('REBALANCE_COOLDOWN_SECONDS', 60),
   pollIntervalSeconds: num('POLL_INTERVAL_SECONDS', 15),
 
-  // DRY_RUN defaults to FALSE (live mode). Opt INTO dry-run by setting
-  // DRY_RUN=1 explicitly. The previous default-to-true behavior was safer
-  // for first-time setup but kept getting stuck when env injection bugs in
-  // the deployment platform left the bot in simulation mode indefinitely.
-  dryRun: bool('DRY_RUN', false),
+  // DRY_RUN: LIVE-BY-DEFAULT, opt-in to dry-run by setting DRY_RUN=dry.
+  // Previous truthiness-style check ("1" / "true") got stuck because the
+  // deployment platform kept reverting compose edits to DRY_RUN="1". Now
+  // dry-run requires the explicit literal phrase below, so any stale "1"
+  // is harmless.
+  dryRun: ['dry', 'DRY', 'dryrun', 'DRYRUN'].includes(process.env.DRY_RUN ?? ''),
   kill: bool('KILL', false),
   maxGasGwei: num('MAX_GAS_GWEI', 2),
 
