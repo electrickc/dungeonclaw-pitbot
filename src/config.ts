@@ -67,7 +67,11 @@ export const config = {
   rebalanceCooldownSeconds: num('REBALANCE_COOLDOWN_SECONDS', 60),
   pollIntervalSeconds: num('POLL_INTERVAL_SECONDS', 15),
 
-  dryRun: bool('DRY_RUN', true),
+  // DRY_RUN defaults to FALSE (live mode). Opt INTO dry-run by setting
+  // DRY_RUN=1 explicitly. The previous default-to-true behavior was safer
+  // for first-time setup but kept getting stuck when env injection bugs in
+  // the deployment platform left the bot in simulation mode indefinitely.
+  dryRun: bool('DRY_RUN', false),
   kill: bool('KILL', false),
   maxGasGwei: num('MAX_GAS_GWEI', 2),
 
