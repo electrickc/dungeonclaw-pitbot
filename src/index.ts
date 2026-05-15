@@ -1,6 +1,6 @@
 import { ethers } from 'ethers'
 import { config } from './config'
-import { snapshot, balances, walletBinPositions, wallet, pool } from './pool'
+import { snapshot, balances, walletBinPositions, wallet, pool, findOrphanedBins } from './pool'
 import { PriceTracker } from './price'
 import { buildWallPlan, decide } from './strategy'
 import {
@@ -11,6 +11,7 @@ import {
   dclawBalance,
   transferWethTo,
   transferDclawTo,
+  reclaimOrphansBurn,
 } from './tx'
 import { emit } from './webhook'
 
@@ -310,6 +311,35 @@ async function main(): Promise<void> {
   )
 
   await withRetry('reconstructWallFromChain', reconstructWallFromChain)
+
+  // Orphan recovery: a previous withdraw cycle may have crashed between
+  // safeBatchTransferFrom and burn, leaving LB shares parked at the pool's
+  // own address. Anyone (including us) can claim them via pool.burn() — the
+  // pool burns from its own balance and sends X+Y to whatever recipient.
+  // We check for these on every boot and reclaim immediately.
+  try {
+    const orphans = await findOrphanedBins(wallet.address)
+    if (orphans.length > 0) {
+      console.log(
+        `[boot][reclaim] FOUND ${orphans.length} orphaned bins — recovering before main loop`,
+      )
+      for (const o of orphans) console.log(`  bin ${o.id}: ${o.poolBalance} shares`)
+      const result = await reclaimOrphansBurn(
+        orphans.map((o) => o.id),
+        orphans.map((o) => o.poolBalance),
+      )
+      console.log(`[boot][reclaim] burn tx: ${result.hash}`)
+      // Refresh balances after recovery
+      const newBal = await balances(wallet.address)
+      console.log(
+        `[boot][reclaim] post-recovery balances: WETH=${ethers.formatEther(newBal.weth)} DCLAW=${ethers.formatEther(newBal.dclaw)}`,
+      )
+    } else {
+      console.log('[boot][reclaim] no orphaned bins found — clean state')
+    }
+  } catch (err) {
+    console.error('[boot][reclaim] orphan recovery failed (continuing anyway):', err)
+  }
 
   // Webhook is best-effort; never block boot on it. If admin is down the bot
   // still ticks; once admin recovers it'll see ticks but might miss the boot.
