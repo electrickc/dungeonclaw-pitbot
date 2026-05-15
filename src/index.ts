@@ -1,6 +1,6 @@
 import { ethers } from 'ethers'
 import { config } from './config'
-import { snapshot, balances, walletBinPositions, wallet } from './pool'
+import { snapshot, balances, walletBinPositions, wallet, pool } from './pool'
 import { PriceTracker } from './price'
 import { buildWallPlan, decide } from './strategy'
 import {
