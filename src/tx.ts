@@ -89,13 +89,14 @@ export async function burnWall(
   if (binIds.length !== shares.length) throw new Error('burn arrays mismatched')
   const ids = binIds.map((b) => BigInt(b))
 
-  // Step 1: deposit the LB shares into the pair
+  // Step 1: deposit the LB shares into the pair. Uses TJ v2.0's 4-arg form
+  // (NOT the standard ERC-1155 5-arg one — that selector doesn't exist
+  // on the contract and reverts immediately on estimateGas).
   const transferData = pool.interface.encodeFunctionData('safeBatchTransferFrom', [
     wallet.address,
     config.poolAddress,
     ids,
     shares,
-    '0x',
   ])
   await send('transferLBSharesToPool', {
     to: config.poolAddress,

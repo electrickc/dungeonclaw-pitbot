@@ -142,15 +142,11 @@ async function tick(): Promise<void> {
 
   // Detect whether any of our wall bins have been "consumed" by sells.
   //
-  // In LB v2.0: bins BELOW active hold quote token (WETH, our deposit), bins
-  // ABOVE active hold base token (DCLAW). When a sell drives the active bin
-  // down through our wall, the bins it crosses get their WETH swapped out for
-  // DCLAW — those bins are now ABOVE the new active and hold DCLAW.
-  //
-  // So a bin is "filled" iff its id > current activeId. (Previous version had
-  // the comparison reversed — every wall bin below active fired as "filled",
-  // which is the NORMAL post-place state. Bug only surfaced in live mode
-  // because dry-run holds no real LB shares to enumerate.)
+  // Ground truth: check each held bin's actual reserveX. If reserveX > 0,
+  // the bin has been swapped through and now holds DCLAW (X) instead of
+  // WETH (Y). We do NOT rely on activeId comparison — on SectorOne's pool
+  // the active bin tracking is stale / slightly off post-swap, and we
+  // observed bins clearly holding DCLAW while still reading id < activeId.
   let anyBinFilled = false
   if (state.wallCenterBin !== null) {
     const positions = await walletBinPositions(
@@ -158,8 +154,15 @@ async function tick(): Promise<void> {
       state.wallCenterBin,
       Math.max(8, config.wallBinCount + 4),
     )
-    for (const p of positions) {
-      if (p.id > snap.activeId) {
+    // Parallel getBin lookups across our held bins (max 7-15 calls).
+    const binReserves = await Promise.all(
+      positions.map(
+        (p) => pool.getBin(p.id) as Promise<[bigint, bigint]>,
+      ),
+    )
+    for (let i = 0; i < positions.length; i++) {
+      const [reserveX] = binReserves[i]
+      if (reserveX > 0n) {
         anyBinFilled = true
         break
       }

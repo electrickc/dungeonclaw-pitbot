@@ -14,8 +14,14 @@ export const LB_PAIR_ABI = [
   // distributionX/Y are in 1e18-scaled fractions per bin (must sum to 1e18 each).
   'function mint(uint256[] ids, uint256[] distributionX, uint256[] distributionY, address to) returns (uint256 amountXAdded, uint256 amountYAdded)',
   'function burn(uint256[] ids, uint256[] amounts, address to) returns (uint256[] amountsX, uint256[] amountsY)',
-  // ERC1155 batch transfer for moving share tokens
-  'function safeBatchTransferFrom(address from, address to, uint256[] ids, uint256[] amounts, bytes data)',
+  // Trader Joe v2.0 LBToken has a CUSTOM 4-arg signature (no `data` field),
+  // not the standard ERC-1155 5-arg one. Critically, this implementation
+  // does NOT invoke onERC1155Received on the recipient — which lets us
+  // transfer LB shares TO the pair contract itself (the pair has no
+  // ERC-1155 receiver hook). This is required because LBPair.burn burns
+  // from address(this), so the shares must be transferred to the pair
+  // before burning.
+  'function safeBatchTransferFrom(address from, address to, uint256[] ids, uint256[] amounts)',
   // Events
   'event Swap(address indexed sender, address indexed recipient, uint24 activeId, bytes32 amountsIn, bytes32 amountsOut, uint24 volatilityAccumulated, uint24 fees)',
   'event CompositionFee(address indexed sender, address indexed recipient, uint24 activeId, bytes32 totalFees)',

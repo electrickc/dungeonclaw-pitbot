@@ -61,7 +61,11 @@ export const config = {
 
   totalWethBudget: req('TOTAL_WETH_BUDGET'),
   wallBinCount: num('WALL_BIN_COUNT', 7),
-  binOffsetFromActive: num('BIN_OFFSET_FROM_ACTIVE', 3),
+  // Tightened from 3 to 1 to punish even modest jeets. Wall now starts
+  // 1 bin below active (-2.4% from spot) instead of 3 (-7.2%). Anyone
+  // selling enough to drop active by a single bin hits the shallowest
+  // wall bin immediately.
+  binOffsetFromActive: num('BIN_OFFSET_FROM_ACTIVE', 1),
   skew: (process.env.SKEW || 'exponential') as 'linear' | 'exponential',
   rebalanceBinsThreshold: num('REBALANCE_BINS_THRESHOLD', 2),
   rebalanceCooldownSeconds: num('REBALANCE_COOLDOWN_SECONDS', 60),
