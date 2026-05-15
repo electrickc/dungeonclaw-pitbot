@@ -137,8 +137,46 @@ async function tick(): Promise<void> {
     process.exit(0)
   }
 
+  // FORCE_WITHDRAW: read fresh from env each tick so user can flip via SecretVM
+  // env edit + restart without rebuild. When set, the bot:
+  //   1. burns ALL held LB positions, recovers WETH+DCLAW to wallet
+  //   2. does NOT place a new wall
+  //   3. stays in this idle state until FORCE_WITHDRAW is unset/0
+  const forceWithdraw =
+    process.env.FORCE_WITHDRAW === '1' ||
+    (process.env.FORCE_WITHDRAW ?? '').toLowerCase() === 'true'
+
   const snap = await snapshot()
   tracker.push(snap.activeId, snap.timestamp)
+
+  if (forceWithdraw) {
+    const positions = await walletBinPositions(
+      wallet.address,
+      state.wallCenterBin ?? snap.activeId,
+      32,
+    )
+    if (positions.length > 0) {
+      console.log(`[force-withdraw] FORCE_WITHDRAW=1 — burning ${positions.length} LB positions`)
+      const r = await withdrawAll()
+      console.log(
+        `[force-withdraw] complete · WETH ${r.wethGained} DCLAW ${r.dclawGained}`,
+      )
+    } else {
+      console.log(
+        '[force-withdraw] no positions to withdraw — idling. Unset FORCE_WITHDRAW to resume normal operation.',
+      )
+    }
+    await emit({
+      type: 'tick',
+      ts: snap.timestamp,
+      activeBin: snap.activeId,
+      raw: {
+        decision: { action: 'force_withdraw', reason: 'FORCE_WITHDRAW=1' },
+        positions: positions.length,
+      },
+    }).catch(() => {})
+    return // never reach the normal place/reposition path
+  }
 
   // Detect whether any of our wall bins have been "consumed" by sells.
   //
