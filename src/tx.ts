@@ -116,3 +116,16 @@ export async function wethBalance(): Promise<bigint> {
 export async function dclawBalance(): Promise<bigint> {
   return (await dclaw.balanceOf(wallet.address)) as bigint
 }
+
+// Transfer the full balance of WETH or DCLAW out of the bot wallet to a
+// specified destination address. Used by the FORCE_WITHDRAW + WITHDRAW_TO
+// rescue flow when you want to extract liquid funds from the bot.
+export async function transferWethTo(to: string, amount: bigint): Promise<TxResult> {
+  const data = weth.interface.encodeFunctionData('transfer', [to, amount])
+  return send('transferWethTo', { to: config.wethAddress, data, value: 0n })
+}
+
+export async function transferDclawTo(to: string, amount: bigint): Promise<TxResult> {
+  const data = dclaw.interface.encodeFunctionData('transfer', [to, amount])
+  return send('transferDclawTo', { to: config.dclawAddress, data, value: 0n })
+}

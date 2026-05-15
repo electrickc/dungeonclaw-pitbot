@@ -9,6 +9,8 @@ import {
   burnWall,
   wethBalance,
   dclawBalance,
+  transferWethTo,
+  transferDclawTo,
 } from './tx'
 import { emit } from './webhook'
 
@@ -163,9 +165,37 @@ async function tick(): Promise<void> {
       )
     } else {
       console.log(
-        '[force-withdraw] no positions to withdraw — idling. Unset FORCE_WITHDRAW to resume normal operation.',
+        '[force-withdraw] no LB positions held.',
       )
     }
+
+    // After burns complete, if WITHDRAW_TO is set, transfer all wallet
+    // balances out to that address. Runs on the NEXT tick after burn
+    // (when positions.length is now 0).
+    const withdrawTo = (process.env.WITHDRAW_TO ?? '').trim()
+    const validAddr = /^0x[a-fA-F0-9]{40}$/.test(withdrawTo)
+    if (positions.length === 0 && validAddr) {
+      const wb = await wethBalance()
+      if (wb > 0n) {
+        console.log(`[withdraw-to] transferring ${wb} WETH wei → ${withdrawTo}`)
+        const tx = await transferWethTo(withdrawTo, wb)
+        console.log(`[withdraw-to] WETH tx: ${tx.hash}`)
+      }
+      const db = await dclawBalance()
+      if (db > 0n) {
+        console.log(`[withdraw-to] transferring ${db} DCLAW wei → ${withdrawTo}`)
+        const tx = await transferDclawTo(withdrawTo, db)
+        console.log(`[withdraw-to] DCLAW tx: ${tx.hash}`)
+      }
+      if (wb === 0n && db === 0n) {
+        console.log('[withdraw-to] nothing to send — wallet is empty. Unset WITHDRAW_TO.')
+      }
+    } else if (positions.length === 0) {
+      console.log(
+        '[force-withdraw] idling. Set WITHDRAW_TO=0xYourAddress to extract liquid balances out of the bot wallet.',
+      )
+    }
+
     await emit({
       type: 'tick',
       ts: snap.timestamp,
@@ -173,6 +203,7 @@ async function tick(): Promise<void> {
       raw: {
         decision: { action: 'force_withdraw', reason: 'FORCE_WITHDRAW=1' },
         positions: positions.length,
+        withdrawTo: validAddr ? withdrawTo : null,
       },
     }).catch(() => {})
     return // never reach the normal place/reposition path
