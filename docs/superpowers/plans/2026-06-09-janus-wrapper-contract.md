@@ -79,8 +79,14 @@ pragma solidity ^0.8.24;
 
 interface ILBPairV2 {
     function getReservesAndId() external view returns (uint256 reserveX, uint256 reserveY, uint256 activeId);
-    function getActiveId() external view returns (uint24);
-    function getBinStep() external view returns (uint16);
+    // Note: deployed TJ LB v2.0 pair (0xA801F4...) does NOT expose getActiveId() or getBinStep() as separate
+    // getters — activeId comes from getReservesAndId()'s third return, and binStep is the first field of
+    // feeParameters() below.
+    function feeParameters() external view returns (
+        uint16 binStep, uint16 baseFactor, uint16 filterPeriod, uint16 decayPeriod,
+        uint16 reductionFactor, uint16 variableFeeControl, uint24 protocolShare,
+        uint24 maxVolatilityAccumulated, uint40 volatilityAccumulated, uint40 volatilityReference, uint16 indexRef
+    );
     function getBin(uint24 id) external view returns (uint128 binReserveX, uint128 binReserveY);
     function balanceOf(address account, uint256 id) external view returns (uint256);
     function balanceOfBatch(address[] calldata accounts, uint256[] calldata ids) external view returns (uint256[] memory);
@@ -551,7 +557,8 @@ function setPositionShape(
     require(n == distX.length && n == distY.length, "len mismatch");
     if (n < minBins || n > maxBins) revert BinCountOutOfRange();
 
-    uint24 activeId = pair.getActiveId();
+    (, , uint256 _activeIdRaw) = pair.getReservesAndId();
+    uint24 activeId = uint24(_activeIdRaw);
     for (uint256 i = 0; i < n; i++) {
         uint256 id = ids[i];
         require(id >= activeId - maxDriftFromActive && id <= uint256(activeId) + maxDriftFromActive, "drift");
@@ -672,10 +679,12 @@ using Uint256x256Math for uint256;
 
 /// @dev Value an (X, Y) pair in WETH terms (i.e., in Y).
 ///      activePrice is Y-per-X in Q128.128 fixed point.
+///      binStep is cached at init time (see notes in §Task 9 below) since the
+///      deployed v2.0 pair has no standalone getBinStep().
 function _valueInWETH(uint256 amountX, uint256 amountY) internal view returns (uint256) {
     if (amountX == 0) return amountY;
-    uint24 activeId = pair.getActiveId();
-    uint16 binStep = pair.getBinStep();
+    (, , uint256 _activeIdRaw) = pair.getReservesAndId();
+    uint24 activeId = uint24(_activeIdRaw);
     uint256 price = PriceHelper.getPriceFromId(activeId, binStep);
     // price is X→Y in Q128.128; amountX * price >> 128 gives amountY-equivalent
     uint256 xInY = amountX.mulShiftRoundDown(price, 128);
