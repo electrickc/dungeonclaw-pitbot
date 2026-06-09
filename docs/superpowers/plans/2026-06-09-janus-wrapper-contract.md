@@ -127,7 +127,7 @@ Empty stub that compiles, with all the state vars, errors, modifiers, and method
 pragma solidity ^0.8.24;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ILBPairV2} from "./interfaces/ILBPairV2.sol";
@@ -136,7 +136,7 @@ import {ILBPairV2} from "./interfaces/ILBPairV2.sol";
 /// @notice Per-team vault wrapping a Trader Joe LB v2.0 pair with MEV-safe
 ///         atomic mint/burn, ERC-20 receipt token, and WETH-denominated
 ///         performance fees. See docs/superpowers/specs/2026-06-09-managed-dlmm-pools-design.md.
-contract JanusWrapper is Initializable, ReentrancyGuardUpgradeable, ERC20Upgradeable {
+contract JanusWrapper is Initializable, ReentrancyGuard, ERC20Upgradeable {
     // ----- Immutable per-clone config (set in initialize) -----
     ILBPairV2 public pair;
     IERC20 public tokenX;          // project token (e.g., DCLAW)
@@ -380,7 +380,7 @@ function initialize(
     string memory symbol_
 ) external initializer {
     __ERC20_init(name_, symbol_);
-    __ReentrancyGuard_init();
+    // OZ v5 ReentrancyGuard uses EIP-7201 storage; no init call needed.
 
     if (uint256(platformFeeBps_) + uint256(teamFeeBps_) > 3000) revert CombinedFeeTooHigh(); // hard cap 30%
     require(pair_ != address(0) && weth_ != address(0) && operator_ != address(0), "zero addr");
