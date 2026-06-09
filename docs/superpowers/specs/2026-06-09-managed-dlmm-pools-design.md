@@ -226,16 +226,47 @@ What the operator **cannot** do:
 
 ### 7.4 Fee mechanism
 
-Accrued LP fees on TJ LB v2.0 are not separately accounted — they are added to the bin reserves as swaps happen. So "fee accrued by the pool" = `burned_X + burned_Y - principal_X - principal_Y` at the moment of a rebalance.
+The wrapper takes a **performance fee on realized LP yield, denominated in WETH only**, charged at two moments: at every rebalance (on aggregate pool yield since the last rebalance), and at every redeem (on the redeeming user's untaxed yield since their last rebalance touchpoint). The two charge points are designed so no value is taxed twice and no value escapes a skim.
 
-At each `rebalanceAtomic` call:
-1. Compute the principal (X + Y value the wrapper deposited into the bins being burned, tracked in storage on the previous mint).
-2. Burn returns actual `outX`, `outY` from the pair.
-3. Delta = (outX − principalX, outY − principalY) — may be negative if price moved against (IL), in which case skim 0.
-4. If positive: skim `feeBps * delta / 10_000` to platform and team recipients (split per the pool's `platformFeeRecipient` / `teamFeeRecipient`).
-5. Remaining (X, Y) is fed into `pair.mint()` for the new shape.
+#### State
 
-LPs effectively pay the platform/team cut **on the fee-yield portion only** — not on principal, not on IL losses.
+- `hwmPerShare` (pool-level) — value-per-share in WETH terms after the most recent rebalance skim. Initialised to the value-per-share of the first deposit.
+- `costBasisPerShare[user]` (per user) — user's weighted-average value-per-share at deposit time. Updated on each deposit: `newBasis = (oldBasis × oldShares + currentVPerShare × newShares) / (oldShares + newShares)`.
+
+#### At `rebalanceAtomic`
+
+1. Burn current position. Pair returns `(outX, outY)`.
+2. Value pool in WETH: `totalValue = outY + outX × activeBinPrice` (X = project token, Y = WETH).
+3. `currentVPerShare = totalValue / receiptTotalSupply`.
+4. If `currentVPerShare > hwmPerShare`:
+   - `skimPerShare = feeBps × (currentVPerShare − hwmPerShare) / 10_000`
+   - `skimTotal = skimPerShare × receiptTotalSupply` (in WETH)
+   - Pay the skim out of `outY`; if `outY < skimTotal`, swap a small amount of `outX → Y` on the pair to satisfy WETH denomination (the swap pays TJ's swap fee — acceptable cost, infrequent in practice since burns typically return some WETH)
+   - Transfer the skim split per pool config to `platformFeeRecipient` / `teamFeeRecipient`
+   - Update `hwmPerShare = currentVPerShare − skimPerShare`
+5. Re-mint the remaining `(outX − feeXPortion, outY − feeYPortion)` into the new shape.
+
+#### At `redeem`
+
+1. User burns `userShares` receipt tokens. Wrapper burns the user's pro-rata LB shares on the pair, gets `(redeemX, redeemY)`.
+2. `userValue = redeemY + redeemX × activeBinPrice` in WETH.
+3. `userValuePerShare = userValue / userShares`.
+4. **Effective basis** prevents double-taxation: `effectiveBasis = max(costBasisPerShare[user], hwmPerShare)`. Anything below HWM was already taxed at the last rebalance. Anything between basis and HWM that the user benefited from has already been paid for via the rebalance skim.
+5. `userYieldPerShare = max(0, userValuePerShare − effectiveBasis)`.
+6. `userFee = feeBps × userYieldPerShare × userShares / 10_000` (in WETH).
+7. If `userFee > 0`, hold back from `redeemY` and transfer to recipients per pool config (same swap-fallback as rebalance if WETH is insufficient).
+8. Send `(redeemX − feeXPortion, redeemY − feeYPortion)` to the user.
+
+#### Why this is correct
+
+- **Rebalance skim** taxes aggregate yield since the last rebalance, pool-level, and updates HWM.
+- **Redeem skim** uses `effectiveBasis = max(costBasis, HWM)` so the *taxable region* per user is always `(effectiveBasis → current)`. Region below HWM was paid pro-rata at the rebalance; region below personal basis is loss territory (capped at zero).
+- A user who deposited *above* HWM (after appreciation, before next rebalance) has `costBasis > HWM`. On redeem, they pay from `costBasis` up. No double-pay.
+- A user who deposited *below* HWM and was in-pool at the prior rebalance had their share of the rebalance skim contributed already. On redeem, they pay only from `HWM` up — the basis→HWM portion was already settled.
+
+#### Acknowledged limitation: late-depositor gap
+
+If User B deposits when pool value has appreciated from HWM=1.0 to V=1.2 (no rebalance yet), B's basis = 1.2. On the *next* rebalance, the pool-level skim taxes the aggregate gain from HWM=1.0 to V=1.2 pro-rata across **all** holders including B. B effectively contributes to a fee on a gain B did not earn. Mitigated by the bot rebalancing often (drift-based + ADVANCED active strategy) so the HWM-to-current gap stays small (≤1-2% under normal conditions). This is the standard performance-fee vault pattern (Yearn, etc.) and we accept it for v1 rather than over-engineer per-user HWM accounting.
 
 ## 8. Off-Chain Components
 
@@ -302,9 +333,12 @@ Two revenue streams from each team:
 - Pre-paid (no auto-pause if a payment misses, but pool can be removed from discovery after grace period)
 
 **Stream 2 — Fee skim from wrapped LP flow.**
-- Platform fee bps: 10% (BASIC) / 20% (ADVANCED) of accrued LP fees, initial values, tunable per pool by platform multisig within `MAX_FEE_BPS` (e.g. 30%)
-- Team fee bps: configurable per pool by the team within `MAX_TEAM_FEE_BPS` (e.g. 10%) — this is the team taking a cut of their own community's LP yield
-- Combined cut is capped — direct LPs always have a better fee posture if they want to skip our service, which is fine; we sell convenience + safety + management
+- Performance fee on LP yield only — never on principal, never on losses. WETH-denominated. See §7.4 for the exact HWM + cost-basis mechanism.
+- Charged at both rebalance time (aggregate, pool-level) and redeem time (per-user, untaxed-yield-only). Two charge points are designed to never double-tax.
+- Platform fee bps: 10% (BASIC) / 20% (ADVANCED) of taxable yield, initial values, tunable per pool by platform multisig within `MAX_FEE_BPS` (e.g. 30%)
+- Team fee bps: configurable per pool by the team within `MAX_TEAM_FEE_BPS` (e.g. 10%) — team's cut of their own community's LP yield
+- Both platform and team get paid in WETH, on-chain, directly to their configured recipient addresses (multisig or EOA) on every rebalance and redeem
+- Combined cut is capped — direct LPs on the underlying pair always have a better fee posture if they want to skip our service. We sell convenience + safety + management, not cheaper fees
 
 Numbers in (e.g. …) are starting points for discussion — not binding.
 
