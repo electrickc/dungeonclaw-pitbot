@@ -93,8 +93,8 @@ interface ILBPairV2 {
     function burn(uint256[] calldata ids, uint256[] calldata amounts, address to)
         external returns (uint256 amountX, uint256 amountY);
     function swap(bool swapForY, address to) external returns (uint128 amountInLeft, uint128 amountOut);
-    function getTokenX() external view returns (address);
-    function getTokenY() external view returns (address);
+    function tokenX() external view returns (address);
+    function tokenY() external view returns (address);
 }
 ```
 
@@ -389,8 +389,8 @@ function initialize(
     pair = ILBPairV2(pair_);
     tokenY = IERC20(weth_);
     // tokenX is derived from pair: WETH is one side, the OTHER side is the project token
-    address pairX = pair.getTokenX();
-    address pairY = pair.getTokenY();
+    address pairX = pair.tokenX();
+    address pairY = pair.tokenY();
     require(pairY == weth_, "weth must be tokenY of pair");
     tokenX = IERC20(pairX);
 
