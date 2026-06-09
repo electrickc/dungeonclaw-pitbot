@@ -55,29 +55,52 @@ The MEV-safe wrapping pattern is the structural value proposition. Active manage
 
 | | |
 |---|---|
-| **Infra** | 1 SecretVM, 1 bot (the DLMM bot) |
+| **Infra** | 1 SecretVM (smaller power tier), 1 bot (the DLMM bot) |
 | **What the bot does** | Handles community deposits/withdrawals; mints into a default Spot-Spread shape (~20 bins around active price); re-centers on drift when active bin moves past a threshold |
 | **Shape switching** | No |
 | **Volatility awareness** | No |
+| **Rebalance after directional move** | Mints into whatever shape the post-burn asset mix allows. If burn returns mostly one asset (because price trended in one direction and the other side got consumed), the bot re-mints a **one-sided shape** — sell wall above active when holding token, buy wall below active when holding WETH. **No swap-to-rebalance.** Honest CLMM-native behaviour: when/if price reverts, the one-sided position consumes back into balance. |
 | **Team config** | Minimal — fee bps and pair address set at deploy, that's it |
 | **Platform fee bps** | Lower (e.g. 10% of accrued fees, settable per pool) |
-| **Subscription** | Lower flat monthly (covers 1 SecretVM) |
+| **Subscription** | Lower flat monthly (covers 1 small SecretVM) |
 | **Buyer** | New projects launching liquidity, teams that want a pool that "just works" |
 
 ### ADVANCED — "Automatic DLMM + Pool Rebalancing" — Price B (> A)
 
 | | |
 |---|---|
-| **Infra** | 2 SecretVMs, 2 bots (DLMM bot + Rebalancing bot) |
-| **DLMM bot** | Same as BASIC — handles all user-facing deposit/withdraw flow, executes rebalance instructions atomically through the wrapper |
-| **Rebalancing bot (new)** | Reads market conditions (active bin movement, swap volume, realized volatility, optional team signals); decides when to rebalance, what shape, what range, what skew; issues rebalance instructions to the DLMM bot |
-| **Shape switching** | Yes — bot picks from full Meteora catalog (Spot, Spot-Concentrated, Spot-Spread, Spot-Wide, Curve, Bid-Ask) per regime |
+| **Infra** | 1 SecretVM (larger power tier), 2 engines in one enclave: **DLMM engine** + **Rebalancing engine**, sharing the operator key, communicating via local IPC |
+| **DLMM engine** | Same as BASIC's bot — handles all user-facing deposit/withdraw flow, executes rebalance instructions atomically through the wrapper |
+| **Rebalancing engine (new, ADVANCED only)** | Reads market conditions (active bin movement, swap volume, realized volatility, optional team signals); decides when to rebalance, what shape, what range, what skew; hands rebalance instructions to the DLMM engine via local IPC inside the same enclave |
+| **Shape switching** | Yes — engine picks from full Meteora catalog (Spot, Spot-Concentrated, Spot-Spread, Spot-Wide, Curve, Bid-Ask) per regime |
 | **Range width** | Dynamic, scaled to volatility |
 | **One-sided shapes** | Yes — sell wall above price, buy wall below, DCA in/out |
-| **Team config** | Allowed shapes, volatility thresholds, rebalance cadence, wall behaviour — set off-chain in the rebalancing bot |
+| **Rebalance after directional move** | Rebalancing engine **chooses** among: (a) re-mint one-sided (same as BASIC, when conviction is "price will revert"); (b) **swap-to-rebalance** via the pair, paying the swap cost to restore a two-sided position (when conviction is "price has moved permanently, capture fees both ways at the new level"); (c) wait — skip the rebalance entirely if neither is justified. Decision governed by strategy params the team sets off-chain. |
+| **Team config** | Allowed shapes, volatility thresholds, rebalance cadence, swap-rebalance policy, wall behaviour — set off-chain in the rebalancing engine |
 | **Platform fee bps** | Higher (e.g. 20% of accrued fees) |
-| **Subscription** | Higher monthly (covers 2 SecretVMs + more compute) |
+| **Subscription** | Higher monthly (covers 1 large SecretVM + strategy ops) |
 | **Buyer** | Established projects with active LP management needs, teams running defensive walls or fee-maximization strategies |
+
+### Why ADVANCED — the fee opportunity LPs are paying for
+
+TJ LB v2.0's swap fee on a pool combines a **base fee** (`baseFactor × binStep`, set per pool at deploy) and a **variable fee** that surges with realized volatility (capped at 10% protocol-wide via `MAX_FEE`). On a high-binstep volatile pair like DCLAW/WETH (binStep=240), combined fees can spike to **~6% per swap during volatility surges** — that is the LP yield ADVANCED's rebalancing engine is trying to maximise capture of. (Exact peak depends on the deployed pair's `baseFactor` and observed volatility; verify against on-chain config before quoting hard numbers to customers.)
+
+Why active rebalancing captures more of that yield than BASIC's passive re-centering:
+
+1. **Stay in range during volatility surges.** When the variable fee is high (volatility is high), active rebalancing re-mints around the new active price *quickly*. Passive re-centering may lag, leaving liquidity in stale bins that earn nothing during the surge.
+2. **Stay two-sided during sustained trends.** Once price has clearly moved to a new level, swap-to-rebalance restores fee capture on *both* directions of wobble around the new level. Passive one-sided positions only earn on a reversion that may not come for hours or days.
+3. **Switch shape to the regime.** Calm market: Curve (concentrated near active price, max fee density). Volatile: Spot-Wide (durable through the storm). Sustained one-way: Bid-Ask one-sided (maximum yield from the breakout). Picking the right shape per regime is the rebalancing engine's job.
+
+Net effect: in volatile markets ADVANCED earns materially more fees than BASIC for the same TVL, and the cost difference (larger VM + higher platform bps) is justified by the extra capture. In quiet markets the gap narrows and BASIC is the rational choice.
+
+### Why one larger SecretVM, not two
+
+Both engines run in the **same enclave**, share the **same operator key**, and communicate via **local IPC** — not a TEE-to-TEE channel. The reasoning:
+
+- Two enclaves with two keys does not add real security — both bots are in the same trust domain (yours), and an enclave compromise that exfiltrates one key would likely exfiltrate the other too. The "2 SecretVMs" framing was security theatre.
+- Local IPC is faster, simpler, and has no signature-verification surface to get wrong.
+- SecretVM offers three power tiers; BASIC uses the smaller, ADVANCED the larger. The cost differential between tiers is what we pass through in pricing — **honest infra cost + margin, not invented headcount of VMs**.
+- One enclave = one attestation surface to verify, one log to monitor, one upgrade cadence.
 
 ### What's identical across tiers
 
@@ -87,7 +110,7 @@ The MEV-safe wrapping pattern is the structural value proposition. Active manage
 - Same discovery listing surface
 - Same MCP integration shape (BASIC is read-only, ADVANCED unlocks actions)
 
-The contract is **tier-agnostic.** Tier is provisioned off-chain (one VM vs two, simple bot vs smart bot, fee bps setting). No tier-specific Solidity. This keeps the contract auditable.
+The contract is **tier-agnostic.** Tier is provisioned off-chain (smaller VM vs larger VM, simple bot vs strategy engine, fee bps setting). No tier-specific Solidity. This keeps the contract auditable.
 
 ## 6. System Architecture
 
@@ -136,22 +159,30 @@ The contract is **tier-agnostic.** Tier is provisioned off-chain (one VM vs two,
                  │ tx submissions
                  │
 ┌────────────────┴─────────────────────────────────────────────────┐
-│   Off-chain (SecretVM, per team)                                 │
+│   Off-chain (one SecretVM per team)                              │
 │                                                                  │
-│   ┌─────────────────────────────────────┐                        │
-│   │  DLMM bot (BASIC + ADVANCED)        │                        │
-│   │  - operator key (in TEE)            │                        │
-│   │  - handles user mint/burn flow      │                        │
-│   │  - executes rebalances              │                        │
-│   └────────────────▲────────────────────┘                        │
-│                    │ rebalance instructions                      │
-│                    │ (only ADVANCED)                             │
-│   ┌────────────────┴────────────────────┐                        │
-│   │  Rebalancing bot (ADVANCED only)    │                        │
-│   │  - reads market state               │                        │
-│   │  - computes shape, range, skew      │                        │
-│   │  - emits rebalance instruction      │                        │
-│   └─────────────────────────────────────┘                        │
+│   ┌──────────────────────────────────────────────────────────┐   │
+│   │  SecretVM enclave (smaller tier = BASIC, larger = ADV)   │   │
+│   │  - operator key born inside enclave, sealed              │   │
+│   │  - shared by all engines in this enclave                 │   │
+│   │                                                          │   │
+│   │  ┌──────────────────────────────┐                        │   │
+│   │  │  DLMM engine                 │                        │   │
+│   │  │  (BASIC + ADVANCED)          │                        │   │
+│   │  │  - handles user deposit/redeem│                       │   │
+│   │  │  - executes rebalances        │                       │   │
+│   │  │  - BASIC: re-center on drift  │                       │   │
+│   │  └──────────────▲───────────────┘                        │   │
+│   │                 │ local IPC                              │   │
+│   │                 │ (in-enclave, no TEE-to-TEE)            │   │
+│   │  ┌──────────────┴───────────────┐                        │   │
+│   │  │  Rebalancing engine          │                        │   │
+│   │  │  (ADVANCED only)             │                        │   │
+│   │  │  - reads market state        │                        │   │
+│   │  │  - picks shape, range, skew  │                        │   │
+│   │  │  - may swap-to-rebalance     │                        │   │
+│   │  └──────────────────────────────┘                        │   │
+│   └──────────────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -208,35 +239,36 @@ LPs effectively pay the platform/team cut **on the fee-yield portion only** — 
 
 ## 8. Off-Chain Components
 
-### 8.1 DLMM bot
+### 8.1 DLMM engine
 
-Runs in SecretVM. Holds the operator key (TEE-sealed). Responsibilities:
+Runs inside the SecretVM enclave. Holds the operator key (TEE-sealed). Present in both tiers. Responsibilities:
 
-- Watch the pair for active-bin moves; trigger re-center on drift past threshold (BASIC default rule).
-- Watch the wrapper for user `deposit`/`redeem` calls — these are atomic on-chain and don't need bot intervention to be safe, but the bot indexes them for stats and discovery UI.
-- Execute rebalance instructions: in BASIC the instruction is computed by this same bot; in ADVANCED it comes from the Rebalancing bot over a coordinated channel.
+- Watch the pair for active-bin moves. In BASIC, trigger re-center on drift past threshold. In ADVANCED, defer trigger decisions to the Rebalancing engine.
+- Watch the wrapper for user `deposit`/`redeem` calls — these are atomic on-chain and don't need engine intervention to be safe, but the engine indexes them for stats and the discovery UI.
+- Execute rebalance instructions atomically through the wrapper. In BASIC the instruction is computed by this engine itself. In ADVANCED it arrives over local in-enclave IPC from the Rebalancing engine.
+- For BASIC's post-burn one-sided case: re-mint the appropriate one-sided shape (sell-wall / buy-wall) at the new center using whatever asset mix the burn returned.
 - Emit observability data (Prometheus-style metrics, structured logs) to the platform's monitoring stack.
 
-This bot is a generalisation of the current PitBot codebase. Reusing `tx.ts` / `pool.ts` / `strategy.ts` patterns; replacing the hard-coded WETH/DCLAW pair with per-pool config.
+This engine is a generalisation of the current PitBot codebase. Reuses `tx.ts` / `pool.ts` / `strategy.ts` patterns; replaces the hard-coded WETH/DCLAW pair with per-pool config.
 
-### 8.2 Rebalancing bot (ADVANCED only)
+### 8.2 Rebalancing engine (ADVANCED only)
 
-Runs in a separate SecretVM. Does **not** hold the operator key. Responsibilities:
+Runs **in the same SecretVM enclave** as the DLMM engine — separate process, separate codebase, same trust boundary. Shares the operator key indirectly (it does not call the wrapper itself; it hands instructions to the DLMM engine, which holds the signing key). Communicates via local Unix-domain socket or shared-memory channel inside the enclave — **no TEE-to-TEE channel, no external signature verification**. Responsibilities:
 
 - Subscribe to on-chain events and indexer feeds for the pair.
 - Compute volatility, recent volume, price drift, custom team signals.
-- Decide rebalance parameters: shape ID, bin range, distribution arrays, optional skew.
-- Send rebalance instructions to the DLMM bot over an authenticated TEE-to-TEE channel.
-- Expose a config interface for the team to tune strategy parameters.
+- Decide rebalance parameters: shape ID, bin range, distribution arrays, optional skew, swap-to-rebalance amount + direction.
+- Hand rebalance instructions to the DLMM engine.
+- Expose a config interface for the team to tune strategy parameters (allowed shapes, volatility thresholds, rebalance cadence, swap-rebalance policy).
 
-The instruction format is simple JSON over signed HTTPS: `{nonce, shape, mintIds, distX, distY, burnIds, burnShares, signature}`. DLMM bot verifies the signature is from the Rebalancing bot's attested TEE key before executing.
+Instruction format is an in-process struct, not a wire format. Privilege gating is by Unix process ownership inside the enclave (both engines run under the same user, both inside the same attested TEE).
 
 ### 8.3 SecretVM hosting
 
-- Each team gets a SecretVM workspace (1 VM for BASIC, 2 for ADVANCED).
+- Each team gets exactly **one** SecretVM enclave. BASIC provisions the smaller power tier; ADVANCED provisions the larger one. (SecretVM offers three power tiers — BASIC sits at the smallest sufficient for the DLMM engine; ADVANCED steps up to handle the strategy compute on top of it.)
 - Platform handles deployment, attestation verification, monitoring, and upgrades.
-- Bot keys are generated *inside* the TEE on first boot and never leave. Platform and team can both verify the attestation but cannot read the keys.
-- Gas funding: bot wallet is funded by the team via the discovery UI; platform abstracts the top-up flow.
+- Operator key is generated *inside* the TEE on first boot and never leaves. Platform and team can both verify the attestation but cannot read the key.
+- Gas funding: operator wallet is funded by the team via the discovery UI; platform abstracts the top-up flow.
 
 ## 9. DLMM Shape Support
 
@@ -263,8 +295,9 @@ These rails are stored on the clone at deploy and tunable only by platform multi
 Two revenue streams from each team:
 
 **Stream 1 — Subscription (covers SecretVM hosting cost + margin).**
-- BASIC: lower flat monthly (sized to cover 1 VM with margin)
-- ADVANCED: higher flat monthly (covers 2 VMs + ops + margin)
+- BASIC: lower flat monthly (sized to cover the smaller SecretVM tier + monitoring + margin)
+- ADVANCED: higher flat monthly (sized to cover the larger SecretVM tier + strategy ops + margin)
+- The delta between tiers ≈ SecretVM tier price delta + ops overhead — honest infra cost pass-through, not invented headcount of VMs
 - Billed off-chain (Stripe / crypto invoicing TBD)
 - Pre-paid (no auto-pause if a payment misses, but pool can be removed from discovery after grace period)
 
@@ -310,7 +343,7 @@ The MCP server has read access to the chain. Action calls go to the team's Rebal
 3. **Wrapper contract bug.** All funds are potentially at risk. Mitigated by: (a) keeping the contract as small as possible — target ~400 LoC; (b) thorough red-team before deploy; (c) external audit before mainnet; (d) per-team clones (one team's pool ≠ another's blast radius).
 4. **Platform (us) goes rogue.** Platform multisig can't withdraw user funds — it has no operator role on the clones. Platform multisig CAN: tune `feeBps` (within cap), pause new deployments, replace the wrapper implementation for *future* clones (existing ones immutable). Existing LPs always have `redeem()`. Platform fee accumulates only via the legitimate skim flow.
 5. **Team goes rogue.** Team operator can rebalance into pathological-but-within-rails shapes (e.g. a shape that earns no fees, or that maximises IL for current price action). They cannot drain. `MIN_BINS` / `MAX_BINS` / `MAX_DRIFT_FROM_ACTIVE` rails limit the worst extremes but cannot guarantee a "good" shape. LPs can `redeem` at any time at the current bin reserves; the UI surfaces recent rebalance frequency and shape history so LPs can see if a team is misbehaving.
-6. **SecretVM attestation broken.** TEE compromise reveals operator keys. Mitigated by attestation verification + key rotation flow + the fact that on-chain enforcement constrains operator power even with a leaked key.
+6. **SecretVM attestation broken.** TEE compromise reveals the operator key. One enclave per team means one attestation surface to defend per team (not two), and one key to rotate if leakage is suspected. Mitigated by attestation verification, a key-rotation flow (rotate the wrapper's operator address via the multisig + team co-sign path), and the fact that on-chain rails constrain operator power even with a leaked key — worst case the attacker can grief via bad rebalances, but cannot drain.
 
 ### Audit scope
 
@@ -336,7 +369,9 @@ Each gets its own implementation plan via `superpowers:writing-plans`. We tackle
 - **Fee bps starting values** — 10% / 20% are guesses. Need market research on competing managed-LP products before committing.
 - **Initial set of supported shapes for ADVANCED** — full Meteora catalog is ambitious. May start with Spot-Spread + Curve + Bid-Ask + Wall, add others later.
 - **What happens to existing LPs when platform replaces the implementation for future clones** — existing clones are immutable by design, so nothing. But this means we cannot patch a clone with a vuln post-deploy; we'd have to coordinate a migration. Acceptable for v1 — confirm with stakeholders.
-- **TEE-to-TEE coordination between DLMM and Rebalancing bot** — needs an authenticated channel design. SecretVM may have native primitives for this; verify.
+- **SecretVM power tier sizing.** SecretVM offers three power tiers; we need to characterise CPU/RAM needs of the DLMM engine alone vs DLMM + Rebalancing combined to pick the right tier for BASIC and ADVANCED. Affects subscription pricing.
+- **Swap-to-rebalance policy and slippage controls (ADVANCED).** When the Rebalancing engine decides to swap to restore balance, what's the safe slippage cap, max swap size per cycle, and cooldown? These need defaults + team-tunable bounds. Decide in the Rebalancing engine implementation plan.
+- **Verify TJ LB v2.0 fee math against the deployed DCLAW/WETH pair.** The "~6% during volatility surges" figure is derived from `baseFee = baseFactor × binStep` + variable fee (capped at 10% MAX_FEE protocol-wide). Need to read the deployed pair's `baseFactor` and observed variable-fee history to validate the number before quoting it to customers.
 - **Direct-LP cannibalisation** — direct LPs on the underlying TJ pair don't pay us anything. Our pitch has to make wrapped LP strictly better (safety, automation, discovery, MCP) than direct LP. This is a product-marketing problem more than a technical one.
 - **Liquidity fragmentation between wrapped and direct LP** — we're adding LP that lives "above" the pair via the wrapper. Wrapped LB shares and direct LB shares both consume the same bin reserves on the pair; no fragmentation at the swap-pricing level. Confirmed safe.
 - **One-sided deposit share math.** When a user deposits only WETH (which mints into bins below active price) or only the project token (above active price), how is their "share of pool value" computed for receipt minting? Naively valuing the deposit at active-bin price under-weights the LP if their side later moves into the money. Two reasonable approaches: (a) value all assets at active price at deposit time (simple, slight unfairness either direction); (b) issue receipt tokens that are *bin-aware* and redeem the depositor's specific bin contribution back at exit. (b) is more correct but breaks the "pure ERC-20" composability story. Decide in the contract implementation plan.
