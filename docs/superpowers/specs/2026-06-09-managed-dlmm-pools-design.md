@@ -320,7 +320,7 @@ Pages:
 
 ## 12. MCP Integration
 
-MCP server deployed alongside the discovery UI. Implements an MCP server that exposes:
+We deploy a **Janus MCP server** alongside the discovery UI that exposes our pools as MCP tools, so AI agents on Base can discover, inspect, simulate, and (for teams) trigger actions against the pools.
 
 **Read tools (BASIC + ADVANCED):**
 - `list_pools(filter)` — discover pools
@@ -329,10 +329,21 @@ MCP server deployed alongside the discovery UI. Implements an MCP server that ex
 - `simulate_deposit(pool, amountX, amountY)` — what receipt-token share would a user get
 
 **Action tools (ADVANCED only, gated by team or user auth):**
-- `propose_rebalance(pool, shape, params)` — team-only; queues a rebalance for the rebalancing bot to act on
-- `set_strategy(pool, config)` — team-only; updates the rebalancing bot's strategy parameters
+- `propose_rebalance(pool, shape, params)` — team-only; queues a rebalance instruction for the team's Rebalancing engine to evaluate and (if accepted) act on
+- `set_strategy(pool, config)` — team-only; updates the team's Rebalancing engine strategy parameters
 
-The MCP server has read access to the chain. Action calls go to the team's Rebalancing bot, not directly to the chain — so the bot can validate before acting.
+The Janus MCP server has read access to Base via direct RPC. Action calls are forwarded to the team's enclave (which terminates inside the Rebalancing engine), so the engine can validate them against its policy before the DLMM engine submits the tx. The MCP server itself never holds operator keys.
+
+### Relationship to Base MCP
+
+"Base MCP" — the broader ecosystem of MCP servers exposing Base chain (Coinbase's reference server + community ones) — is **adjacent infrastructure** we ride and extend, not infrastructure we build on:
+
+- **Inside the Rebalancing engine: no MCP.** Strategy decisions use deterministic code with direct RPC reads. LLM-mediated reads via MCP would add latency, a query-translation surface, and non-determinism to a process that moves user money. Strategy code stays auditable.
+- **Tool-schema convention: borrow from Base MCP.** Where Coinbase's Base MCP server already defines a tool shape (e.g. how a balance lookup is named/parametrised), we mirror it so agents already trained against Base MCP find our Janus tools familiar.
+- **Discoverability: ride the protocol.** Agents configured to talk to Base MCP servers will find ours natural; we benefit from the existing agent-side adoption.
+- **Optional future:** an LLM-driven strategy variant of the Rebalancing engine could consume Base MCP for reads as a research direction — not v1.
+
+Net: Janus MCP **extends** the Base agent toolset; the Rebalancing engine **does not depend on** Base MCP.
 
 ## 13. Trust & Security
 
