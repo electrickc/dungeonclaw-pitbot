@@ -82,10 +82,14 @@ interface ILBPairV2 {
     // Note: deployed TJ LB v2.0 pair (0xA801F4...) does NOT expose getActiveId() or getBinStep() as separate
     // getters — activeId comes from getReservesAndId()'s third return, and binStep is the first field of
     // feeParameters() below.
+    // 12-field FeeParameters struct from the v2.0 (LBLegacyPair) deployment.
+    // Verified shape via cast call + ILBLegacyPair.FeeParameters struct definition
+    // in lib/joe-v2/src/. Note: field types differ from later v2.1 variants.
     function feeParameters() external view returns (
         uint16 binStep, uint16 baseFactor, uint16 filterPeriod, uint16 decayPeriod,
-        uint16 reductionFactor, uint16 variableFeeControl, uint24 protocolShare,
-        uint24 maxVolatilityAccumulated, uint40 volatilityAccumulated, uint40 volatilityReference, uint16 indexRef
+        uint16 reductionFactor, uint24 variableFeeControl, uint16 protocolShare,
+        uint24 maxVolatilityAccumulated, uint24 volatilityAccumulated,
+        uint24 volatilityReference, uint24 indexRef, uint40 time
     );
     function getBin(uint24 id) external view returns (uint128 binReserveX, uint128 binReserveY);
     function balanceOf(address account, uint256 id) external view returns (uint256);
