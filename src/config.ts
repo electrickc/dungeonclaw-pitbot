@@ -1,25 +1,14 @@
 import * as fs from 'fs'
-import * as dotenv from 'dotenv'
 
-dotenv.config()
-
-function loadSecret(name: string): string {
+function loadSecret(name: string, required: boolean): string | undefined {
   const filePath = process.env[`${name}_FILE`]
   if (filePath && fs.existsSync(filePath)) {
     return fs.readFileSync(filePath, 'utf8').trim()
   }
   const direct = process.env[name]
   if (direct) return direct.trim()
-  throw new Error(`Missing secret: ${name} (set ${name} or ${name}_FILE)`)
-}
-
-function loadSecretOpt(name: string): string | undefined {
-  const filePath = process.env[`${name}_FILE`]
-  if (filePath && fs.existsSync(filePath)) {
-    return fs.readFileSync(filePath, 'utf8').trim()
-  }
-  const direct = process.env[name]
-  return direct ? direct.trim() : undefined
+  if (required) throw new Error(`Missing secret: ${name} (set ${name} or ${name}_FILE)`)
+  return undefined
 }
 
 function req(name: string): string {
@@ -28,61 +17,20 @@ function req(name: string): string {
   return v
 }
 
-function num(name: string, fallback?: number): number {
-  const v = process.env[name]
-  if (!v) {
-    if (fallback !== undefined) return fallback
-    throw new Error(`Missing env: ${name}`)
+export interface BotConfig {
+  poolId: string
+  controlPlaneUrl: string
+  controlPlaneToken: string
+  rpcUrl: string
+  statePath: string
+}
+
+export function loadConfig(): BotConfig {
+  return {
+    poolId: req('POOL_ID'),
+    controlPlaneUrl: req('CONTROL_PLANE_URL'),
+    controlPlaneToken: loadSecret('CONTROL_PLANE_TOKEN', true)!,
+    rpcUrl: req('RPC_URL'),
+    statePath: process.env.STATE_PATH ?? '/data/state.json',
   }
-  const n = Number(v)
-  if (!Number.isFinite(n)) throw new Error(`Env ${name} is not a number: ${v}`)
-  return n
-}
-
-function bool(name: string, fallback: boolean): boolean {
-  const v = process.env[name]
-  if (v === undefined) return fallback
-  return v === '1' || v.toLowerCase() === 'true'
-}
-
-export const config = {
-  privateKey: loadSecret('BOT_PRIVATE_KEY'),
-  drpcKey: loadSecret('DRPC_BASE_KEY'),
-  adminHmac: loadSecret('ADMIN_WEBHOOK_HMAC'),
-  // Optional: only needed if admin app is behind Vercel Deployment Protection.
-  vercelBypassSecret: loadSecretOpt('VERCEL_BYPASS_SECRET'),
-
-  adminWebhookUrl: req('ADMIN_WEBHOOK_URL'),
-
-  poolAddress: req('POOL_ADDRESS'),
-  dclawAddress: req('DCLAW_ADDRESS'),
-  wethAddress: req('WETH_ADDRESS'),
-  binStep: num('BIN_STEP', 240),
-
-  totalWethBudget: req('TOTAL_WETH_BUDGET'),
-  wallBinCount: num('WALL_BIN_COUNT', 7),
-  // Tightened from 3 to 1 to punish even modest jeets. Wall now starts
-  // 1 bin below active (-2.4% from spot) instead of 3 (-7.2%). Anyone
-  // selling enough to drop active by a single bin hits the shallowest
-  // wall bin immediately.
-  binOffsetFromActive: num('BIN_OFFSET_FROM_ACTIVE', 1),
-  skew: (process.env.SKEW || 'exponential') as 'linear' | 'exponential',
-  rebalanceBinsThreshold: num('REBALANCE_BINS_THRESHOLD', 2),
-  rebalanceCooldownSeconds: num('REBALANCE_COOLDOWN_SECONDS', 60),
-  pollIntervalSeconds: num('POLL_INTERVAL_SECONDS', 15),
-
-  // DRY_RUN: LIVE-BY-DEFAULT, opt-in to dry-run by setting DRY_RUN=dry.
-  // Previous truthiness-style check ("1" / "true") got stuck because the
-  // deployment platform kept reverting compose edits to DRY_RUN="1". Now
-  // dry-run requires the explicit literal phrase below, so any stale "1"
-  // is harmless.
-  dryRun: ['dry', 'DRY', 'dryrun', 'DRYRUN'].includes(process.env.DRY_RUN ?? ''),
-  kill: bool('KILL', false),
-  maxGasGwei: num('MAX_GAS_GWEI', 2),
-
-  logLevel: process.env.LOG_LEVEL || 'info',
-} as const
-
-export function rpcUrl(): string {
-  return `https://lb.drpc.live/base/${config.drpcKey}`
 }
