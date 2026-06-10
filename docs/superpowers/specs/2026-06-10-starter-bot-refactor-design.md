@@ -52,13 +52,13 @@ This spec covers **the bot itself** — sub-project 2 of the V1 decomposition.
 
 ### Tiers
 
-| Tier | DLABS held | USDC monthly | Strategies | Auto-rebalance |
+| Tier | Stake | USDC monthly | Strategies | Auto-rebalance |
 |---|---|---|---|---|
-| **OPEN** | 0 | Highest | Spot-Spread only | No |
-| **BASIC** | 100M | Lower | Spot-Spread OR Wall | No |
-| **ADVANCED** | 250M | Lowest | All shapes (Spot-Concentrated, Spot-Spread, Spot-Wide, Curve, Bid-Ask, Wall) | Yes (dynamic shape switching, smart triggers) |
+| **OPEN** | 0 DLABS | Higher | Spot-Spread | No |
+| **STARTER** | 100M DLABS (30-day unstake cooldown) | Lower | Spot-Spread + Spot-Wide + Wall | No |
+| **ADVANCED** | TBD (250M+) | Lowest | + Spot-Concentrated + Curve + Bid-Ask + auto-rebalancing agent | Yes (dynamic shape switching) |
 
-Sub-project 2 (this spec) covers **OPEN and BASIC** strategies. ADVANCED's additional shapes + auto-rebalance are sub-project 3, layered on the same codebase.
+Sub-project 2 (this spec) covers **OPEN and STARTER** strategies — three shapes total: Spot-Spread, Spot-Wide, Wall. ADVANCED adds the remaining three shapes + the auto-rebalancing meta-strategy in sub-project 3, layered on the same codebase. DLABS must be **staked** (not just held) via a dedicated staking contract with a 30-day unstake cooldown — sub-project 7.
 
 ## 3. Scope
 
@@ -68,7 +68,7 @@ Sub-project 2 (this spec) covers **OPEN and BASIC** strategies. ADVANCED's addit
 - TEE-sealed bot wallet generated at first boot
 - Gnosis Safe (1-of-2) signing via `safe.execTransaction`
 - Atomic mint/burn via existing PitBotHelper-style helper contract
-- Two strategy modules: `SpotSpreadStrategy` and `WallStrategy`, behind a common `Strategy` interface
+- Three strategy modules: `SpotSpreadStrategy`, `SpotWideStrategy`, and `WallStrategy`, behind a common `Strategy` interface
 - Drift-based rebalance trigger (same logic as current PitBot)
 - Per-pool config loaded from control plane on every sync poll
 - State machine: BOOT → PENDING_SAFE_SETUP → RECONCILE → OPERATIONAL → PAUSED → RETIRED
@@ -80,16 +80,17 @@ Sub-project 2 (this spec) covers **OPEN and BASIC** strategies. ADVANCED's addit
 - **No on-chain billing** — handled off-chain by teller bot scanning USDC payments
 - **No on-chain DLABS gating** — tier checks happen in teller bot before SecretVM provisioning
 - **No inbound network surface on the bot** — all comms outbound to control plane
-- **No ADVANCED strategies** (Concentrated, Wide, Curve, Bid-Ask) — sub-project 3
-- **No smart-trigger / auto-rebalance** — sub-project 3
+- **No ADVANCED strategies** (Spot-Concentrated, Curve, Bid-Ask) — sub-project 3
+- **No smart-trigger / auto-rebalance agent** — sub-project 3
 - **No dashboard UI** — sub-project 5
 - **No teller bot or provisioning service** — sub-project 4
+- **No DLABS staking contract** — sub-project 7
 
-## 4. The two STARTER strategies
+## 4. The three STARTER strategies
 
-### `SpotSpreadStrategy` (OPEN + BASIC + ADVANCED default)
+### `SpotSpreadStrategy` (OPEN + STARTER + ADVANCED default)
 
-Uniform distribution across N bins centered on the active bin. Both X and Y populated when both assets are available; one-sided fallback when only one asset is on hand.
+Uniform distribution across ~20-30 bins centered on the active bin. Both X and Y populated when both assets are available; one-sided fallback when only one asset is on hand.
 
 **Config knobs (per pool):**
 - `binCount` — total bins in the spread (default 20)
@@ -98,9 +99,19 @@ Uniform distribution across N bins centered on the active bin. Both X and Y popu
 
 **One-sided fallback rule:** if the Safe's available X is less than 1% of total deposit value, treat as "Y-only" and mint all Y below active (buy-pressure side). Symmetrically for "X-only" → mint all X above active (sell-pressure side). The 1% threshold avoids re-mint thrashing from dust. This is the design spec's "honest CLMM-native behaviour: when/if price reverts, the one-sided position consumes back into balance."
 
-### `WallStrategy` (BASIC + ADVANCED)
+### `SpotWideStrategy` (STARTER + ADVANCED)
 
-The existing PitBot defensive wall logic, preserved verbatim. Y-only bins below the active bin, configurable depth + skew.
+Same as Spot-Spread but ~50 bins, durable across larger price moves, lower per-dollar fee capture in exchange for fewer rebalances.
+
+**Config knobs (per pool):**
+- `binCount` — total bins (default 50)
+- `binsAbove`, `binsBelow` — derived as above
+
+Same one-sided fallback rule as Spot-Spread.
+
+### `WallStrategy` (STARTER + ADVANCED)
+
+The existing PitBot defensive wall logic, preserved verbatim from current `src/strategy.ts`. Y-only bins below the active bin, configurable depth + skew. This is DungeonClaw's existing strategy and the DCLAW pool's first-day migration uses this with the same knobs as today.
 
 **Config knobs (per pool):**
 - `binCount` — number of wall bins (default 7)
@@ -111,7 +122,7 @@ The existing PitBot defensive wall logic, preserved verbatim. Y-only bins below 
 
 ```typescript
 export interface Strategy {
-  readonly id: 'spot-spread' | 'wall'
+  readonly id: 'spot-spread' | 'spot-wide' | 'wall'
 
   /** Given activeBin and current (xWei, yWei) on hand, return a mint plan. */
   plan(input: {
@@ -153,7 +164,8 @@ src/
 ├── pool.ts               # provider, signer, pair + helper + safe wrappers
 ├── strategy/
 │   ├── index.ts          # Strategy interface
-│   ├── spot-spread.ts    # uniform-around-active impl
+│   ├── spot-spread.ts    # ~20 bin uniform-around-active impl
+│   ├── spot-wide.ts      # ~50 bin uniform-around-active impl
 │   └── wall.ts           # one-sided defensive wall impl
 ├── trigger.ts            # drift-based re-center logic
 ├── safeSigner.ts         # Gnosis Safe signing + execTransaction submission
@@ -380,6 +392,7 @@ Fire-and-forget. Failures are queued and retried; events don't block bot operati
 - New file: `controlPlane.ts`
 - New file: `state.ts` (state machine)
 - New file: `strategy/spot-spread.ts`
+- New file: `strategy/spot-wide.ts`
 
 ### Drop
 - The single-tenant env-var-only config pattern
@@ -396,21 +409,23 @@ Fire-and-forget. Failures are queued and retried; events don't block bot operati
 ## 12. What this unblocks
 
 V1 with this bot landed:
-- DungeonClaw migrates DCLAW/WETH pool to: Safe + new helper (clone of PitBotHelper) + this bot
-- Wall strategy preserved, same defensive behavior
-- New teams can sign up for OPEN/BASIC tiers, use Spot-Spread default
-- Teller bot (sub-project 4) handles billing + provisioning
+- DungeonClaw migrates DCLAW/WETH pool to: Safe + new helper (clone of PitBotHelper) + this bot, staying on the Wall strategy (now part of STARTER tier). DungeonClaw becomes the platform's first STARTER customer.
+- New teams can sign up for OPEN (Spot-Spread only, no stake required) or STARTER (Spot-Spread + Spot-Wide + Wall, 100M DLABS stake)
+- Teller bot (sub-project 4) handles billing + provisioning + DLABS staking-balance checks
 - Dashboard (sub-project 5) handles team UX
-- ADVANCED tier (sub-project 3) can layer on additional strategies + smart triggers later without redesigning the bot's core
+- ADVANCED tier (sub-project 3) layers on Spot-Concentrated + Curve + Bid-Ask + auto-rebalancing agent later without redesigning the bot's core
 
 ## 13. Sub-project dependency order for V1
 
-1. Helper contract (already deployed as `PitBotHelper.sol`; a tiny factory wrapper to deploy per team) — **sub-project 6**
+1. **Helper contract** (existing `PitBotHelper.sol` + a tiny factory wrapper to deploy per team) — **sub-project 6**
 2. **STARTER bot (this spec)** — **sub-project 2**
-3. Teller bot (payment scanning, tier resolution, SecretVM provisioning) — **sub-project 4**
-4. Dashboard UI (pool setup, Safe ops, bot control) — **sub-project 5**
-5. Onboarding + migration of DCLAW pool — operational, not a code sub-project
-6. ADVANCED bot (extra strategies + smart trigger) — **sub-project 3** (deferred)
+3. **DLABS staking contract** (stake / requestUnstake / claim with 30-day cooldown) — **sub-project 7**
+4. **Teller bot** (USDC payment scanning, DLABS stake balance lookup, SecretVM provisioning) — **sub-project 4**
+5. **Dashboard UI** (pool setup wizard, Safe ops, bot control panel, stake/unstake) — **sub-project 5**
+6. Onboarding + migration of DCLAW pool to STARTER tier — operational, not a code sub-project
+7. **ADVANCED bot** (Spot-Concentrated + Curve + Bid-Ask + auto-rebalancing agent) — **sub-project 3** (deferred to v1.5)
+
+Sub-projects 2 (this), 6 (helper factory), and 7 (staking) can land first independently. 4 (teller) depends on 7 (it reads stake balances). 5 (dashboard) is the last to land before user-facing launch.
 
 Sub-project 2 (this one) can be built in parallel with sub-project 4 (teller). Sub-project 5 (dashboard) gates user-facing launch but can lag.
 
