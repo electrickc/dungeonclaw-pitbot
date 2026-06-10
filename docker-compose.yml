@@ -1,71 +1,15 @@
-# SecretVM-compatible compose file.
-#
-# Secrets are declared in the `secrets:` block at the bottom. SecretVM seals
-# these values during deployment and exposes them to the container as files
-# under /run/secrets/<name>. The bot reads them via the *_FILE convention
-# (see src/config.ts loadSecret()).
-#
-# Non-secret config lives under `environment:` and is fine to commit.
-#
-# To deploy:
-#   1. Fill the values in the secrets section below (or have SecretVM inject
-#      them at deploy time).
-#   2. `docker compose up -d` inside the TEE.
-#
-# To stop / kill switch:
-#   - Soft kill: set KILL=1 in environment and restart. Bot exits gracefully
-#     on next tick without sending any pending tx.
-#   - Hard kill: `docker compose down`. Wallet state is reconstructable from
-#     on-chain reads at next start.
-
 services:
-  pitbot:
+  bot:
     build: .
-    restart: unless-stopped
     environment:
-      # --- secret references (read from /run/secrets/*) ---
-      BOT_PRIVATE_KEY_FILE: /run/secrets/bot_private_key
-      DRPC_BASE_KEY_FILE: /run/secrets/drpc_base_key
-      ADMIN_WEBHOOK_HMAC_FILE: /run/secrets/admin_webhook_hmac
+      POOL_ID: pool-dev
+      CONTROL_PLANE_URL: http://host.docker.internal:8080
+      CONTROL_PLANE_TOKEN: dev-token
+      RPC_URL: https://mainnet.base.org
+      STATE_PATH: /data/state.json
+    volumes:
+      - bot-state:/data
+    restart: unless-stopped
 
-      # --- non-secret config ---
-      ADMIN_WEBHOOK_URL: https://admin.dungeonclaw.com/api/pitbot/event
-
-      POOL_ADDRESS: "0xa801f4addaa97ed96f0c38430cdf937b9c84487b"
-      DCLAW_ADDRESS: "0xb7965A38552E0f7D5B728BAd1Ef2817ca7AE0B68"
-      WETH_ADDRESS: "0x4200000000000000000000000000000000000006"
-      BIN_STEP: "240"
-
-      TOTAL_WETH_BUDGET: "0.1"
-      WALL_BIN_COUNT: "7"
-      BIN_OFFSET_FROM_ACTIVE: "3"
-      SKEW: "exponential"
-      REBALANCE_BINS_THRESHOLD: "2"
-      REBALANCE_COOLDOWN_SECONDS: "60"
-      POLL_INTERVAL_SECONDS: "15"
-
-      # --- safety knobs ---
-      # DRY_RUN=1 logs intended tx without sending. Flip to 0 only after
-      # 24h of clean dry-run telemetry in the admin dashboard.
-      DRY_RUN: "1"
-      KILL: "0"
-      MAX_GAS_GWEI: "2"
-
-      LOG_LEVEL: info
-
-    secrets:
-      - bot_private_key
-      - drpc_base_key
-      - admin_webhook_hmac
-
-    # Bot only needs outbound HTTPS — no inbound ports.
-    # No bind mounts. State is in-memory; on crash it reconstructs from chain.
-
-secrets:
-  bot_private_key:
-    # Replace at deployment. NEVER commit a populated file.
-    file: ./secrets/bot_private_key
-  drpc_base_key:
-    file: ./secrets/drpc_base_key
-  admin_webhook_hmac:
-    file: ./secrets/admin_webhook_hmac
+volumes:
+  bot-state:
