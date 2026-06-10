@@ -26,4 +26,23 @@ describe('SpotSpreadStrategy.plan', () => {
     expect(plan.amountX).toBe(1_000_000_000_000_000_000n)
     expect(plan.amountY).toBe(1_000_000_000_000_000_000n)
   })
+
+  it('one-sided Y when xAvailable is dust', () => {
+    const strat = new SpotSpreadStrategy({ binCount: 20, binsAbove: 10, binsBelow: 10 })
+    const plan = strat.plan({
+      activeBin: 8388608,
+      xAvailable: 1n, // dust
+      yAvailable: 1_000_000_000_000_000_000n,
+    })
+    expect(plan.amountX).toBe(0n)
+    expect(plan.amountY).toBe(1_000_000_000_000_000_000n)
+    expect(plan.distributionX.reduce((a, b) => a + b, 0n)).toBe(0n)
+    expect(plan.distributionY.reduce((a, b) => a + b, 0n)).toBe(10n ** 18n)
+    // All Y must be at bins below active
+    for (let i = 0; i < plan.binIds.length; i++) {
+      if (plan.distributionY[i] > 0n) {
+        expect(plan.binIds[i]).toBeLessThan(8388608)
+      }
+    }
+  })
 })
