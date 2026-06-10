@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { SpotSpreadStrategy } from '../../src/strategy/spot-spread'
-import { buildStrategy } from '../../src/strategy/index'
+import { buildStrategy } from '../../src/strategy'
 
 describe('SpotSpreadStrategy.plan', () => {
   it('builds a 20-bin uniform shape centered on active when both assets present', () => {

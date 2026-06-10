@@ -2,7 +2,7 @@ import { ethers } from 'ethers'
 import { HELPER_ABI } from './abi'
 import { Pool } from './pool'
 import { SafeSigner } from './safeSigner'
-import type { MintPlan } from './strategy/index'
+import type { MintPlan } from './strategy'
 
 const helperIface = new ethers.Interface(HELPER_ABI)
 

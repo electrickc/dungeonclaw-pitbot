@@ -5,7 +5,7 @@ import { BotStateManager } from './state'
 import { Pool } from './pool'
 import { SafeSigner } from './safeSigner'
 import { TxLayer } from './tx'
-import { buildStrategy, Strategy } from './strategy/index'
+import { buildStrategy, Strategy } from './strategy'
 import { decide } from './trigger'
 
 const cfg = loadConfig()
