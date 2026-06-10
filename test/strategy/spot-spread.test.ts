@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { SpotSpreadStrategy } from '../../src/strategy/spot-spread'
+import { buildStrategy } from '../../src/strategy/index'
 
 describe('SpotSpreadStrategy.plan', () => {
   it('builds a 20-bin uniform shape centered on active when both assets present', () => {
@@ -62,5 +63,20 @@ describe('SpotSpreadStrategy.plan', () => {
         expect(plan.binIds[i]).toBeGreaterThan(8388608)
       }
     }
+  })
+})
+
+describe('buildStrategy', () => {
+  it('builds Spot-Spread from spec', () => {
+    const s = buildStrategy({ type: 'spot-spread', knobs: {} })
+    expect(s.id).toBe('spot-spread')
+  })
+  it('builds Spot-Wide from spec', () => {
+    const s = buildStrategy({ type: 'spot-wide', knobs: {} })
+    expect(s.id).toBe('spot-wide')
+  })
+  it('builds Wall from spec', () => {
+    const s = buildStrategy({ type: 'wall', knobs: {} })
+    expect(s.id).toBe('wall')
   })
 })

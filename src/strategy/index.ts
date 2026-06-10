@@ -25,3 +25,5 @@ export interface Strategy {
 
   plan(input: PlanInput): MintPlan
 }
+
+export { buildStrategy } from './factory'
