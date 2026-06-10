@@ -1,388 +1,234 @@
 import { ethers } from 'ethers'
-import { config } from './config'
-import { snapshot, balances, walletBinPositions, wallet, pool, findOrphanedBins } from './pool'
-import { PriceTracker } from './price'
-import { buildWallPlan, decide } from './strategy'
-import {
-  transferWethToPool,
-  mintWall,
-  burnWall,
-  wethBalance,
-  dclawBalance,
-  transferWethTo,
-  transferDclawTo,
-  reclaimOrphansBurn,
-} from './tx'
-import { emit } from './webhook'
+import { loadConfig } from './config'
+import { ControlPlaneClient, SyncResponse } from './controlPlane'
+import { BotStateManager } from './state'
+import { Pool } from './pool'
+import { SafeSigner } from './safeSigner'
+import { TxLayer } from './tx'
+import { buildStrategy, Strategy } from './strategy/index'
+import { decide } from './trigger'
 
-const tracker = new PriceTracker()
+const cfg = loadConfig()
+const stateManager = new BotStateManager(cfg.statePath)
+const cp = new ControlPlaneClient({
+  baseUrl: cfg.controlPlaneUrl,
+  token: cfg.controlPlaneToken,
+  poolId: cfg.poolId,
+})
 
-interface BotState {
-  lastRebalanceTs: number
-  // Center bin of the currently-placed wall, or null if no wall.
-  wallCenterBin: number | null
-  // Cumulative WETH and DCLAW the bot has accumulated (signed wei strings,
-  // for the admin's P&L view to aggregate).
-  cumulativeWethIn: bigint
-  cumulativeDclawIn: bigint
+let consecutiveSyncFailures = 0
+let lastSync: SyncResponse | null = null
+let pool: Pool | null = null
+let signer: SafeSigner | null = null
+let tx: TxLayer | null = null
+let strategy: Strategy | null = null
+
+// Bot key — generated once and held in process memory.
+// In production this is sealed by the SecretVM TEE.
+let botWallet: ethers.HDNodeWallet | null = null
+
+function ensureBotWallet(): ethers.HDNodeWallet {
+  if (botWallet) return botWallet
+  botWallet = ethers.Wallet.createRandom()
+  return botWallet
 }
 
-const state: BotState = {
-  lastRebalanceTs: 0,
-  wallCenterBin: null,
-  cumulativeWethIn: 0n,
-  cumulativeDclawIn: 0n,
+async function boot() {
+  console.log(`[boot] pool=${cfg.poolId} state=${stateManager.current}`)
+  const wallet = ensureBotWallet()
+  await cp.handshake(wallet.address)
+  console.log(`[boot] handshake sent, address=${wallet.address}`)
+  stateManager.transition('PENDING_SAFE_SETUP', { reason: 'handshake complete' })
 }
 
-// On startup, reconstruct wall state by scanning the bins around current active.
-async function reconstructWallFromChain(): Promise<void> {
-  const snap = await snapshot()
-  const positions = await walletBinPositions(wallet.address, snap.activeId, 32)
-  if (positions.length === 0) {
-    state.wallCenterBin = null
-    console.log(`[boot] no existing wall positions found`)
+async function poll() {
+  let sync: SyncResponse
+  try {
+    sync = await cp.sync()
+    consecutiveSyncFailures = 0
+    lastSync = sync
+  } catch (e) {
+    consecutiveSyncFailures += 1
+    console.error(`[sync] failure ${consecutiveSyncFailures}: ${e}`)
+    if (lastSync && consecutiveSyncFailures >= lastSync.consecutiveSyncFailureThreshold) {
+      if (stateManager.current === 'OPERATIONAL') {
+        stateManager.transition('PAUSED', { reason: 'control plane unreachable' })
+      }
+    }
     return
   }
-  // Wall center = mean of held bin IDs
-  const sum = positions.reduce((a, p) => a + p.id, 0)
-  state.wallCenterBin = Math.round(sum / positions.length)
-  console.log(
-    `[boot] reconstructed wall: ${positions.length} bins held, center ~${state.wallCenterBin}, active ${snap.activeId}`,
-  )
+
+  if (sync.status === 'retired') {
+    stateManager.transition('RETIRED', { reason: 'retired by control plane' })
+    process.exit(0)
+  }
+
+  if (sync.killSwitch && stateManager.current === 'OPERATIONAL') {
+    stateManager.transition('PAUSED', { reason: 'kill switch' })
+    return
+  }
+
+  switch (stateManager.current) {
+    case 'PENDING_SAFE_SETUP':
+      if (sync.safeAddress && sync.helperAddress && sync.pairAddress && sync.strategy) {
+        await reconcile(sync)
+      }
+      break
+    case 'OPERATIONAL':
+      if (sync.status === 'paused') {
+        stateManager.transition('PAUSED', { reason: 'paused by control plane' })
+      } else {
+        await operationalTick(sync)
+      }
+      break
+    case 'PAUSED':
+      if (sync.status === 'operational' && !sync.killSwitch) {
+        stateManager.transition('OPERATIONAL', { reason: 'resumed' })
+      }
+      break
+  }
 }
 
-async function placeWall(activeBin: number): Promise<void> {
-  const wethAvail = await wethBalance()
-  const budgetWei = ethers.parseEther(config.totalWethBudget)
-  const useWei = wethAvail < budgetWei ? wethAvail : budgetWei
+async function reconcile(sync: SyncResponse) {
+  stateManager.transition('RECONCILE', { reason: 'safe + strategy configured' })
 
-  if (useWei === 0n) {
-    console.log(`[place] no WETH balance — skipping`)
-    await emit({
-      type: 'rebalance_skipped',
+  if (!sync.safeAddress || !sync.helperAddress || !sync.pairAddress || !sync.strategy) {
+    throw new Error('reconcile called with incomplete sync')
+  }
+
+  const wallet = ensureBotWallet()
+  const tempProvider = new ethers.JsonRpcProvider(cfg.rpcUrl)
+  const tempPair = new ethers.Contract(
+    sync.pairAddress,
+    ['function tokenX() view returns (address)', 'function tokenY() view returns (address)'],
+    tempProvider,
+  )
+  const [tokenX, tokenY] = await Promise.all([tempPair.tokenX(), tempPair.tokenY()])
+
+  pool = new Pool(cfg.rpcUrl, wallet.privateKey, {
+    safe: sync.safeAddress,
+    helper: sync.helperAddress,
+    pair: sync.pairAddress,
+    tokenX,
+    tokenY,
+  })
+
+  try {
+    await pool.validateInvariants()
+  } catch (e) {
+    stateManager.transition('PAUSED', { reason: `invariant violation: ${e}` })
+    await cp.emitEvent({
       ts: Math.floor(Date.now() / 1000),
-      activeBin,
-      raw: { reason: 'zero WETH balance' },
+      type: 'error',
+      payload: { reason: 'invariant violation', error: String(e) },
     })
     return
   }
 
-  const plan = buildWallPlan(activeBin, useWei)
-  console.log(
-    `[place] active=${activeBin} weth=${ethers.formatEther(useWei)} bins=${plan.binIds.join(',')}`,
-  )
+  signer = new SafeSigner(pool.safe, pool.wallet)
+  tx = new TxLayer(pool, signer)
+  strategy = buildStrategy(sync.strategy)
 
-  const transferTx = await transferWethToPool(useWei)
-  const mintTx = await mintWall(plan)
+  const snap = await pool.snapshot()
+  const positions = await pool.safeBinPositions(snap.activeBin, 50)
+  const currentCenter =
+    positions.length === 0 ? null : Math.round(positions.reduce((a, p) => a + p.id, 0) / positions.length)
+  stateManager.update({ currentCenter })
 
-  // Wall center = midpoint of the planned bins
-  const center = Math.round(
-    plan.binIds.reduce((a, b) => a + b, 0) / plan.binIds.length,
-  )
-  state.wallCenterBin = center
-  state.lastRebalanceTs = Math.floor(Date.now() / 1000)
-
-  await emit({
-    type: 'rebalance_placed',
-    ts: state.lastRebalanceTs,
-    txHash: mintTx.hash,
-    activeBin,
-    wallCenterBin: center,
-    wethDelta: (-useWei).toString(),
-    raw: {
-      binIds: plan.binIds,
-      weiPerBin: plan.weiPerBin.map((b) => b.toString()),
-      transferHash: transferTx.hash,
-      skew: config.skew,
-    },
-  })
+  stateManager.transition('OPERATIONAL', { reason: 'reconciled' })
 }
 
-async function withdrawAll(): Promise<{ wethGained: bigint; dclawGained: bigint }> {
-  const wethBefore = await wethBalance()
-  const dclawBefore = await dclawBalance()
-
-  const snap = await snapshot()
-  const positions = await walletBinPositions(wallet.address, snap.activeId, 32)
-  if (positions.length === 0) return { wethGained: 0n, dclawGained: 0n }
-
-  const ids = positions.map((p) => p.id)
-  const shares = positions.map((p) => p.shares)
-  const burnTx = await burnWall(ids, shares)
-
-  // In dry-run mode, burnTx.hash === '0xDRY_RUN' and balances won't change.
-  // We still want the event to fire so the admin can see the intention.
-  const wethAfter = await wethBalance()
-  const dclawAfter = await dclawBalance()
-  const wethGained = wethAfter - wethBefore
-  const dclawGained = dclawAfter - dclawBefore
-
-  state.wallCenterBin = null
-  state.cumulativeWethIn += wethGained
-  state.cumulativeDclawIn += dclawGained
-
-  await emit({
-    type: 'withdrawal',
-    ts: Math.floor(Date.now() / 1000),
-    txHash: burnTx.hash,
-    activeBin: snap.activeId,
-    wethDelta: wethGained.toString(),
-    dclawDelta: dclawGained.toString(),
-    raw: { binIds: ids, shares: shares.map((s) => s.toString()) },
-  })
-
-  return { wethGained, dclawGained }
-}
-
-async function tick(): Promise<void> {
-  if (config.kill) {
-    console.log('[kill] KILL=1, exiting')
-    process.exit(0)
+async function operationalTick(sync: SyncResponse) {
+  if (!pool || !tx || !strategy) {
+    stateManager.transition('PAUSED', { reason: 'operational without pool/tx/strategy' })
+    return
   }
 
-  // FORCE_WITHDRAW: read fresh from env each tick so user can flip via SecretVM
-  // env edit + restart without rebuild. When set, the bot:
-  //   1. burns ALL held LB positions, recovers WETH+DCLAW to wallet
-  //   2. does NOT place a new wall
-  //   3. stays in this idle state until FORCE_WITHDRAW is unset/0
-  const forceWithdraw =
-    process.env.FORCE_WITHDRAW === '1' ||
-    (process.env.FORCE_WITHDRAW ?? '').toLowerCase() === 'true'
-
-  const snap = await snapshot()
-  tracker.push(snap.activeId, snap.timestamp)
-
-  if (forceWithdraw) {
-    const positions = await walletBinPositions(
-      wallet.address,
-      state.wallCenterBin ?? snap.activeId,
-      32,
-    )
-    if (positions.length > 0) {
-      console.log(`[force-withdraw] FORCE_WITHDRAW=1 — burning ${positions.length} LB positions`)
-      const r = await withdrawAll()
-      console.log(
-        `[force-withdraw] complete · WETH ${r.wethGained} DCLAW ${r.dclawGained}`,
-      )
-    } else {
-      console.log(
-        '[force-withdraw] no LB positions held.',
-      )
-    }
-
-    // After burns complete, if WITHDRAW_TO is set, transfer all wallet
-    // balances out to that address. Runs on the NEXT tick after burn
-    // (when positions.length is now 0).
-    const withdrawTo = (process.env.WITHDRAW_TO ?? '').trim()
-    const validAddr = /^0x[a-fA-F0-9]{40}$/.test(withdrawTo)
-    if (positions.length === 0 && validAddr) {
-      const wb = await wethBalance()
-      if (wb > 0n) {
-        console.log(`[withdraw-to] transferring ${wb} WETH wei → ${withdrawTo}`)
-        const tx = await transferWethTo(withdrawTo, wb)
-        console.log(`[withdraw-to] WETH tx: ${tx.hash}`)
-      }
-      const db = await dclawBalance()
-      if (db > 0n) {
-        console.log(`[withdraw-to] transferring ${db} DCLAW wei → ${withdrawTo}`)
-        const tx = await transferDclawTo(withdrawTo, db)
-        console.log(`[withdraw-to] DCLAW tx: ${tx.hash}`)
-      }
-      if (wb === 0n && db === 0n) {
-        console.log('[withdraw-to] nothing to send — wallet is empty. Unset WITHDRAW_TO.')
-      }
-    } else if (positions.length === 0) {
-      console.log(
-        '[force-withdraw] idling. Set WITHDRAW_TO=0xYourAddress to extract liquid balances out of the bot wallet.',
-      )
-    }
-
-    await emit({
-      type: 'tick',
-      ts: snap.timestamp,
-      activeBin: snap.activeId,
-      raw: {
-        decision: { action: 'force_withdraw', reason: 'FORCE_WITHDRAW=1' },
-        positions: positions.length,
-        withdrawTo: validAddr ? withdrawTo : null,
-      },
-    }).catch(() => {})
-    return // never reach the normal place/reposition path
+  if (sync.strategy && sync.strategy.type !== strategy.id) {
+    strategy = buildStrategy(sync.strategy)
   }
 
-  // Detect whether any of our wall bins have been "consumed" by sells.
-  //
-  // Ground truth: check each held bin's actual reserveX. If reserveX > 0,
-  // the bin has been swapped through and now holds DCLAW (X) instead of
-  // WETH (Y). We do NOT rely on activeId comparison — on SectorOne's pool
-  // the active bin tracking is stale / slightly off post-swap, and we
-  // observed bins clearly holding DCLAW while still reading id < activeId.
-  let anyBinFilled = false
-  if (state.wallCenterBin !== null) {
-    const positions = await walletBinPositions(
-      wallet.address,
-      state.wallCenterBin,
-      Math.max(8, config.wallBinCount + 4),
-    )
-    // Parallel getBin lookups across our held bins (max 7-15 calls).
-    const binReserves = await Promise.all(
-      positions.map(
-        (p) => pool.getBin(p.id) as Promise<[bigint, bigint]>,
-      ),
-    )
-    for (let i = 0; i < positions.length; i++) {
-      const [reserveX] = binReserves[i]
-      if (reserveX > 0n) {
-        anyBinFilled = true
-        break
-      }
-    }
-  }
+  const snap = await pool.snapshot()
+  const positions = await pool.safeBinPositions(snap.activeBin, 50)
+  const anyBinFilled = positions.some((p) => p.id < snap.activeBin)
 
-  const decision = decide({
-    activeBin: snap.activeId,
-    hasWall: state.wallCenterBin !== null,
-    wallCenterBin: state.wallCenterBin,
-    lastRebalanceTs: state.lastRebalanceTs,
-    nowTs: snap.timestamp,
+  const action = decide({
+    activeBin: snap.activeBin,
+    currentCenter: stateManager.snapshot.currentCenter,
+    lastRebalanceTs: stateManager.snapshot.lastRebalanceTs,
+    nowTs: Math.floor(Date.now() / 1000),
     anyBinFilled,
+    rebalanceCooldownSeconds: sync.rebalanceCooldownSeconds,
+    rebalanceBinsThreshold: 2,
   })
 
-  console.log(
-    `[tick] active=${snap.activeId} wallCenter=${state.wallCenterBin} filled=${anyBinFilled} → ${decision.action} (${decision.reason})`,
-  )
+  console.log(`[tick] active=${snap.activeBin} action=${action.action} reason=${action.reason}`)
 
-  await emit({
-    type: 'tick',
-    ts: snap.timestamp,
-    activeBin: snap.activeId,
-    wallCenterBin: state.wallCenterBin,
-    raw: { decision, anyBinFilled, dryRun: config.dryRun },
-  })
+  if (action.action === 'hold') return
 
-  if (decision.action === 'place') {
-    await placeWall(snap.activeId)
-  } else if (decision.action === 'reposition') {
-    await withdrawAll()
-    await placeWall(snap.activeId)
-  } else if (decision.action === 'withdraw_filled') {
-    await withdrawAll()
-    // Re-place at the new (lower) active in the same tick so we never go
-    // without a bid wall longer than one tick.
-    const newSnap = await snapshot()
-    await placeWall(newSnap.activeId)
-  }
-}
-
-// Retry helper for startup RPC reads. Transient dRPC failures (load-balancer
-// flips, brief 429s, websocket reconnects) used to kill the container before
-// the main loop ever started, triggering Docker's restart-loop. Now we retry
-// up to 5 times with exponential backoff before giving up.
-async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 5): Promise<T> {
-  let lastErr: unknown
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn()
-    } catch (err) {
-      lastErr = err
-      const delayMs = Math.min(1000 * 2 ** i, 15000)
-      console.warn(
-        `[boot] ${label} attempt ${i + 1}/${attempts} failed:`,
-        err instanceof Error ? err.message : err,
-        `— retrying in ${delayMs}ms`,
-      )
-      await new Promise((r) => setTimeout(r, delayMs))
-    }
-  }
-  throw lastErr
-}
-
-async function main(): Promise<void> {
-  console.log(`[boot] pitbot v0.1.0`)
-  console.log(`[boot] wallet=${wallet.address}`)
-  console.log(`[boot] dryRun=${config.dryRun}, kill=${config.kill}`)
-  console.log(
-    `[boot] strategy: ${config.skew} skew, ${config.wallBinCount} bins, offset ${config.binOffsetFromActive}, budget ${config.totalWethBudget} WETH`,
-  )
-
-  const bal = await withRetry('balances', () => balances(wallet.address))
-  console.log(
-    `[boot] balances: ETH=${ethers.formatEther(bal.eth)} WETH=${ethers.formatEther(bal.weth)} DCLAW=${ethers.formatEther(bal.dclaw)}`,
-  )
-
-  await withRetry('reconstructWallFromChain', reconstructWallFromChain)
-
-  // Orphan recovery: a previous withdraw cycle may have crashed between
-  // safeBatchTransferFrom and burn, leaving LB shares parked at the pool's
-  // own address. Anyone (including us) can claim them via pool.burn() — the
-  // pool burns from its own balance and sends X+Y to whatever recipient.
-  // We check for these on every boot and reclaim immediately.
   try {
-    const orphans = await findOrphanedBins(wallet.address)
-    if (orphans.length > 0) {
-      console.log(
-        `[boot][reclaim] FOUND ${orphans.length} orphaned bins — recovering before main loop`,
-      )
-      for (const o of orphans) console.log(`  bin ${o.id}: ${o.poolBalance} shares`)
-      const result = await reclaimOrphansBurn(
-        orphans.map((o) => o.id),
-        orphans.map((o) => o.poolBalance),
-      )
-      console.log(`[boot][reclaim] burn tx: ${result.hash}`)
-      // Refresh balances after recovery
-      const newBal = await balances(wallet.address)
-      console.log(
-        `[boot][reclaim] post-recovery balances: WETH=${ethers.formatEther(newBal.weth)} DCLAW=${ethers.formatEther(newBal.dclaw)}`,
-      )
-    } else {
-      console.log('[boot][reclaim] no orphaned bins found — clean state')
-    }
-  } catch (err) {
-    console.error('[boot][reclaim] orphan recovery failed (continuing anyway):', err)
-  }
-
-  // Webhook is best-effort; never block boot on it. If admin is down the bot
-  // still ticks; once admin recovers it'll see ticks but might miss the boot.
-  emit({
-    type: 'boot',
-    ts: Math.floor(Date.now() / 1000),
-    raw: {
-      wallet: wallet.address,
-      dryRun: config.dryRun,
-      eth: bal.eth.toString(),
-      weth: bal.weth.toString(),
-      dclaw: bal.dclaw.toString(),
-      wallCenterBin: state.wallCenterBin,
-    },
-  }).catch(() => {})
-
-  // Main loop. Top-level catch so one bad tick doesn't kill the bot.
-  for (;;) {
-    try {
-      await tick()
-    } catch (err) {
-      console.error('[tick] error:', err)
-      await emit({
-        type: 'error',
+    if (action.action === 'withdraw_filled') {
+      const ids = positions.map((p) => p.id)
+      const shares = positions.map((p) => p.shares)
+      const receipt = await tx.burn(ids, shares)
+      stateManager.update({ currentCenter: null, lastRebalanceTs: Math.floor(Date.now() / 1000) })
+      await cp.emitEvent({
         ts: Math.floor(Date.now() / 1000),
-        raw: { message: err instanceof Error ? err.message : String(err) },
-      }).catch(() => {})
+        type: 'withdraw',
+        payload: { txHash: receipt.hash, binIds: ids, shareTotal: shares.reduce((a, b) => a + b, 0n).toString() },
+      })
+    } else {
+      if (positions.length > 0) {
+        const ids = positions.map((p) => p.id)
+        const shares = positions.map((p) => p.shares)
+        await tx.burn(ids, shares)
+      }
+      const updatedSnap = await pool.snapshot()
+      const plan = strategy.plan({
+        activeBin: updatedSnap.activeBin,
+        xAvailable: updatedSnap.safeXBalance,
+        yAvailable: updatedSnap.safeYBalance,
+      })
+      const receipt = await tx.mint(plan)
+      const newCenter = Math.round(plan.binIds.reduce((a, b) => a + b, 0) / plan.binIds.length)
+      stateManager.update({ currentCenter: newCenter, lastRebalanceTs: Math.floor(Date.now() / 1000) })
+      await cp.emitEvent({
+        ts: Math.floor(Date.now() / 1000),
+        type: action.action === 'place' ? 'place' : 'rebalance',
+        payload: { txHash: receipt.hash, binIds: plan.binIds, newCenter },
+      })
     }
-    await new Promise((r) => setTimeout(r, config.pollIntervalSeconds * 1000))
+  } catch (e) {
+    console.error(`[op] failure: ${e}`)
+    await cp.emitEvent({
+      ts: Math.floor(Date.now() / 1000),
+      type: 'error',
+      payload: { action: action.action, error: String(e) },
+    })
   }
 }
 
-// Belt and braces: capture unhandled promise rejections and uncaught exceptions
-// so they go to stdout (visible in `docker logs`) instead of silently killing
-// the process. The bot can survive most issues; we'd rather see what broke.
-process.on('unhandledRejection', (reason) => {
-  console.error('[unhandledRejection]', reason)
-})
-process.on('uncaughtException', (err) => {
-  console.error('[uncaughtException]', err)
-})
+async function main() {
+  process.on('SIGTERM', () => {
+    console.log('[shutdown] SIGTERM received')
+    process.exit(0)
+  })
 
-main().catch((err) => {
-  console.error('[fatal]', err)
+  await boot()
+  await poll()
+
+  const interval = setInterval(async () => {
+    try {
+      await poll()
+    } catch (e) {
+      console.error(`[poll] uncaught: ${e}`)
+    }
+  }, (lastSync?.syncPollIntervalSeconds ?? 30) * 1000)
+
+  void interval
+}
+
+main().catch((e) => {
+  console.error('[fatal]', e)
   process.exit(1)
 })
