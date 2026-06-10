@@ -1,140 +1,93 @@
 import { ethers } from 'ethers'
-import { config, rpcUrl } from './config'
-import { LB_PAIR_ABI, ERC20_ABI } from './abi'
+import { LB_PAIR_ABI, HELPER_ABI, SAFE_ABI, ERC20_ABI } from './abi'
 
-export const provider = new ethers.JsonRpcProvider(rpcUrl(), 8453, {
-  staticNetwork: true,
-})
-
-export const wallet = new ethers.Wallet(config.privateKey, provider)
-
-export const pool = new ethers.Contract(config.poolAddress, LB_PAIR_ABI, wallet)
-export const dclaw = new ethers.Contract(config.dclawAddress, ERC20_ABI, wallet)
-export const weth = new ethers.Contract(config.wethAddress, ERC20_ABI, wallet)
+export interface PoolAddresses {
+  pair: string
+  helper: string
+  safe: string
+  tokenX: string
+  tokenY: string
+}
 
 export interface PoolSnapshot {
+  activeBin: number
+  binStep: number
+  safeXBalance: bigint
+  safeYBalance: bigint
+}
+
+export interface BinPosition {
+  id: number
+  shares: bigint
   reserveX: bigint
   reserveY: bigint
-  activeId: number
-  blockNumber: number
-  timestamp: number
 }
 
-export async function snapshot(): Promise<PoolSnapshot> {
-  const [block, [reserveX, reserveY, activeId]] = await Promise.all([
-    provider.getBlock('latest'),
-    pool.getReservesAndId() as Promise<[bigint, bigint, bigint]>,
-  ])
-  if (!block) throw new Error('No latest block from RPC')
-  return {
-    reserveX,
-    reserveY,
-    activeId: Number(activeId),
-    blockNumber: block.number,
-    timestamp: block.timestamp,
+export class Pool {
+  readonly provider: ethers.JsonRpcProvider
+  readonly wallet: ethers.Wallet
+  readonly pair: ethers.Contract
+  readonly helper: ethers.Contract
+  readonly safe: ethers.Contract
+  readonly tokenX: ethers.Contract
+  readonly tokenY: ethers.Contract
+  private cachedBinStep: number | null = null
+
+  constructor(rpcUrl: string, botPrivateKey: string, readonly addrs: PoolAddresses) {
+    this.provider = new ethers.JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true })
+    this.wallet = new ethers.Wallet(botPrivateKey, this.provider)
+    this.pair = new ethers.Contract(addrs.pair, LB_PAIR_ABI, this.wallet)
+    this.helper = new ethers.Contract(addrs.helper, HELPER_ABI, this.wallet)
+    this.safe = new ethers.Contract(addrs.safe, SAFE_ABI, this.wallet)
+    this.tokenX = new ethers.Contract(addrs.tokenX, ERC20_ABI, this.wallet)
+    this.tokenY = new ethers.Contract(addrs.tokenY, ERC20_ABI, this.wallet)
   }
-}
 
-export async function balances(addr: string): Promise<{ weth: bigint; dclaw: bigint; eth: bigint }> {
-  const [w, d, e] = await Promise.all([
-    weth.balanceOf(addr) as Promise<bigint>,
-    dclaw.balanceOf(addr) as Promise<bigint>,
-    provider.getBalance(addr),
-  ])
-  return { weth: w, dclaw: d, eth: e }
-}
-
-// Bin ID 2^23 is the "center" where price (tokenY per tokenX, raw) = 1.0.
-// price(bin) = (1 + binStep/10000)^(bin - 2^23). Each bin is binStep bps wide.
-const BIN_CENTER = 2 ** 23
-
-export function binToPrice(binId: number, binStep: number): number {
-  return Math.pow(1 + binStep / 10000, binId - BIN_CENTER)
-}
-
-// Find which of our LB token IDs (bin shares) the wallet currently holds.
-// Returns the IDs and amounts for a range of bin IDs (sliding window).
-//
-// Uses ERC-1155 balanceOfBatch — a SINGLE RPC call returns balances for all
-// 2*radius+1 bins at once. Previously this fired N parallel balanceOf calls
-// (up to 65 with default radius), which routinely tripped dRPC rate limits.
-export async function walletBinPositions(
-  addr: string,
-  centerBin: number,
-  radius = 32,
-): Promise<{ id: number; shares: bigint }[]> {
-  const ids: number[] = []
-  const accounts: string[] = []
-  for (let i = -radius; i <= radius; i++) {
-    ids.push(centerBin + i)
-    accounts.push(addr)
+  async getActiveBin(): Promise<number> {
+    const [, , activeId] = await this.pair.getReservesAndId()
+    return Number(activeId)
   }
-  const results = (await pool.balanceOfBatch(accounts, ids)) as bigint[]
-  return ids
-    .map((id, i) => ({ id, shares: results[i] }))
-    .filter((p) => p.shares > 0n)
-}
 
-// Detect ORPHANED LB shares: LB tokens we transferred to the pool during a
-// withdraw cycle that crashed before the burn() call. They sit at the pool's
-// own address; anyone can burn them via pool.burn(ids, amounts, anyAddress).
-//
-// Recovery strategy: query our most recent DepositedToBin events to identify
-// bins we've minted into recently. For each, check if the pool currently
-// holds LB shares there. If so AND we don't hold any ourselves AND the pool's
-// holdings are at most what we deposited → it's our orphan, burn it back.
-export interface OrphanedBin {
-  id: number
-  poolBalance: bigint
-}
-
-export async function findOrphanedBins(
-  selfAddress: string,
-  lookbackBlocks = 50000,
-): Promise<OrphanedBin[]> {
-  const head = await provider.getBlockNumber()
-  const fromBlock = Math.max(0, head - lookbackBlocks)
-
-  // Query DepositedToBin events filtered to our wallet as recipient.
-  // event DepositedToBin(address indexed sender, address indexed recipient, uint256 indexed id, uint256 amountX, uint256 amountY)
-  const filter = {
-    address: pool.target as string,
-    topics: [
-      ethers.id('DepositedToBin(address,address,uint256,uint256,uint256)'),
-      null,
-      ethers.zeroPadValue(selfAddress, 32),
-    ],
-    fromBlock,
-    toBlock: head,
+  async getBinStep(): Promise<number> {
+    if (this.cachedBinStep != null) return this.cachedBinStep
+    const [bs] = await this.pair.feeParameters()
+    this.cachedBinStep = Number(bs)
+    return this.cachedBinStep
   }
-  const logs = await provider.getLogs(filter)
 
-  // Unique bins we've deposited into recently
-  const ourBins = new Set<number>()
-  for (const log of logs) {
-    if (log.topics[3]) ourBins.add(Number(BigInt(log.topics[3])))
+  async snapshot(): Promise<PoolSnapshot> {
+    const [activeBin, binStep, safeX, safeY] = await Promise.all([
+      this.getActiveBin(),
+      this.getBinStep(),
+      this.tokenX.balanceOf(this.addrs.safe).then(BigInt),
+      this.tokenY.balanceOf(this.addrs.safe).then(BigInt),
+    ])
+    return { activeBin, binStep, safeXBalance: safeX, safeYBalance: safeY }
   }
-  if (ourBins.size === 0) return []
 
-  // For each candidate bin, check (pool balance, our balance) in parallel.
-  const binIds = Array.from(ourBins)
-  const accounts: string[] = []
-  const idsForCall: number[] = []
-  for (const id of binIds) {
-    accounts.push(pool.target as string)
-    idsForCall.push(id)
-    accounts.push(selfAddress)
-    idsForCall.push(id)
+  /** Scan a window of bins around activeBin and return positions where Safe holds shares. */
+  async safeBinPositions(activeBin: number, windowSize: number): Promise<BinPosition[]> {
+    const start = activeBin - windowSize
+    const end = activeBin + windowSize
+    const positions: BinPosition[] = []
+    for (let id = start; id <= end; id++) {
+      const shares = BigInt(await this.pair.balanceOf(this.addrs.safe, id))
+      if (shares > 0n) {
+        positions.push({ id, shares, reserveX: 0n, reserveY: 0n })
+      }
+    }
+    return positions
   }
-  const balances = (await pool.balanceOfBatch(accounts, idsForCall)) as bigint[]
 
-  const orphans: OrphanedBin[] = []
-  for (let i = 0; i < binIds.length; i++) {
-    const poolBalance = balances[i * 2]
-    const ourBalance = balances[i * 2 + 1]
-    if (poolBalance > 0n && ourBalance === 0n) {
-      orphans.push({ id: binIds[i], poolBalance })
+  /** Assert invariants used at RECONCILE state. */
+  async validateInvariants(): Promise<void> {
+    const helperOwner = await this.helper.OWNER()
+    if (helperOwner.toLowerCase() !== this.addrs.safe.toLowerCase()) {
+      throw new Error(`helper owner is ${helperOwner}, expected Safe ${this.addrs.safe}`)
+    }
+    const isBotOwner = await this.safe.isOwner(this.wallet.address)
+    if (!isBotOwner) {
+      throw new Error(`bot wallet ${this.wallet.address} is not a Safe owner`)
     }
   }
-  return orphans
 }
