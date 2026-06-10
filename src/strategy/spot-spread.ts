@@ -9,7 +9,7 @@ export interface SpotSpreadConfig {
 const ONE = 10n ** 18n
 
 export class SpotSpreadStrategy implements Strategy {
-  readonly id = 'spot-spread' as const
+  readonly id: Strategy['id'] = 'spot-spread'
 
   constructor(private readonly cfg: SpotSpreadConfig) {
     if (cfg.binsAbove + cfg.binsBelow !== cfg.binCount) {
