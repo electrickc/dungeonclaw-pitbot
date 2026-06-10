@@ -159,7 +159,7 @@ async function operationalTick(sync: SyncResponse) {
     nowTs: Math.floor(Date.now() / 1000),
     anyBinFilled,
     rebalanceCooldownSeconds: sync.rebalanceCooldownSeconds,
-    rebalanceBinsThreshold: 2,
+    rebalanceBinsThreshold: sync.strategy?.knobs.rebalanceBinsThreshold ?? 2,
   })
 
   console.log(`[tick] active=${snap.activeBin} action=${action.action} reason=${action.reason}`)
