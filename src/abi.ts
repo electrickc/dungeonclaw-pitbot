@@ -11,7 +11,7 @@ export const LB_PAIR_ABI = [
   'function feeParameters() view returns (uint16, uint16, uint16, uint16, uint16, uint24, uint16, uint24, uint24, uint24, uint24, uint40)',
 ] as const
 
-// PitBotHelper (atomic mint+burn wrapper)
+// JanusHelper (atomic mint+burn wrapper)
 export const HELPER_ABI = [
   'function mintAtomic(uint256[] ids, uint256[] distributionX, uint256[] distributionY, uint256 amountX, uint256 amountY) returns (uint256 amountXAdded, uint256 amountYAdded)',
   'function burnAtomic(uint256[] ids, uint256[] shares) returns (uint256 amountX, uint256 amountY)',

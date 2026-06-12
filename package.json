@@ -1,8 +1,8 @@
 {
-  "name": "dungeonclaw-pitbot",
-  "version": "0.1.0",
+  "name": "janus-starter-bot",
+  "version": "0.1.5",
   "private": true,
-  "description": "DLMM bid-wall accumulator for DCLAW/WETH on SectorOne Base. TEE-deployed.",
+  "description": "Multi-tenant DLMM bot for the JanusDLMM platform. TEE-deployed inside SecretVM, signs Safe txs to manage LB v2.0 positions on Base.",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",

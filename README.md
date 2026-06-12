@@ -1,4 +1,4 @@
-# dungeonclaw-pitbot
+# dungeonclaw-janus-starter-bot
 
 DLMM bid-wall accumulator for DCLAW/WETH on SectorOne (Base mainnet).
 Deployed to a SecretVM TEE; private key never leaves the enclave.
@@ -60,7 +60,7 @@ for local dev only.
 | Service | Direction | Auth |
 |---|---|---|
 | dRPC Base RPC | outbound | URL path segment (the secret above) |
-| dungeonclaw-admin `/api/pitbot/event` | outbound | HMAC-SHA256 over body |
+| dungeonclaw-admin `/api/janus-starter-bot/event` | outbound | HMAC-SHA256 over body |
 
 No inbound network. No DB. No bind-mounted state. On crash, wall state is
 reconstructed from chain reads on next boot.
@@ -91,8 +91,8 @@ reconstructed from chain reads on next boot.
 ## Monitoring
 
 All meaningful state changes emit a webhook event to
-`https://admin.dungeonclaw.com/api/pitbot/event`. The admin UI at
-`/admin/finance/pitbot` shows recent events and daily P&L.
+`https://admin.dungeonclaw.com/api/janus-starter-bot/event`. The admin UI at
+`/admin/finance/janus-starter-bot` shows recent events and daily P&L.
 
 Event types: `boot`, `tick`, `rebalance_placed`, `rebalance_skipped`,
 `bin_filled`, `withdrawal`, `error`.

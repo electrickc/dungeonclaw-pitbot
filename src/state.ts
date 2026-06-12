@@ -17,12 +17,20 @@ export interface BotState {
   currentCenter: number | null
 }
 
+// PAUSED → PENDING_SAFE_SETUP is allowed so a container restart can recover
+// without manual VM rebuild (the boot() flow re-enters PENDING_SAFE_SETUP).
+// Same for OPERATIONAL → PENDING_SAFE_SETUP in case the persisted state is
+// OPERATIONAL but in-memory pool/signer were lost on crash.
 const VALID_TRANSITIONS: Record<StateName, StateName[]> = {
   BOOT: ['PENDING_SAFE_SETUP'],
   PENDING_SAFE_SETUP: ['RECONCILE', 'PAUSED', 'RETIRED'],
-  RECONCILE: ['OPERATIONAL', 'PAUSED', 'RETIRED'],
-  OPERATIONAL: ['PAUSED', 'RETIRED'],
-  PAUSED: ['OPERATIONAL', 'RETIRED'],
+  // PENDING_SAFE_SETUP is allowed so the boot-time reset can recover from a
+  // stale RECONCILE persisted in state.json after a mid-reconcile crash.
+  // Without this, the bot crash-loops at startup because the persisted state
+  // is RECONCILE and boot() can't legally reset it.
+  RECONCILE: ['OPERATIONAL', 'PAUSED', 'RETIRED', 'PENDING_SAFE_SETUP'],
+  OPERATIONAL: ['PAUSED', 'RETIRED', 'PENDING_SAFE_SETUP'],
+  PAUSED: ['OPERATIONAL', 'RETIRED', 'PENDING_SAFE_SETUP'],
   RETIRED: [],
 }
 

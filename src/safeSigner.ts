@@ -2,24 +2,29 @@ import { ethers } from 'ethers'
 
 /**
  * Signs a Safe transaction hash producing a 65-byte signature in the format
- * Safe.execTransaction expects.
+ * Safe.execTransaction expects: r (32) ++ s (32) ++ v (1).
  *
- * Safe signature format: r (32) ++ s (32) ++ v (1).
- * EIP-191 prefix bumps v by +4 — Safe accepts both.
+ * Safe v1.4.1 `checkSignatures` v-byte semantics:
+ *   v = 0       → ERC-1271 contract signature
+ *   v = 1       → pre-validated owner (msg.sender or approvedHashes)
+ *   v = 27/28   → standard secp256k1 ecrecover over the raw 32-byte hash
+ *   v = 31/32   → ecrecover over EIP-191-prefixed hash (`"\x19Ethereum Signed Message:\n32" || h`)
+ *
+ * We sign the raw safeTxHash directly (no EIP-191 prefix), so v MUST stay
+ * 27/28. Bumping by +4 (to 31/32) makes Safe re-prefix when recovering,
+ * which yields a different signer address → GS026 "Invalid owner provided".
  */
 export async function computeSafeSignature(
   wallet: ethers.Wallet,
   safeTxHash: string,
 ): Promise<string> {
-  // ethers `signMessage` hashes with the EIP-191 prefix; safeTxHash is already a 32-byte
-  // hash so we sign the digest directly using signingKey.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const signing = (wallet as any).signingKey ?? new ethers.SigningKey(wallet.privateKey)
   const sig = signing.sign(safeTxHash)
-  // Adjust v to 31/32 (Safe's pre-validated marker) so the bot's pre-signed sig is accepted.
-  const adjustedV = sig.v + 4
   const r = sig.r.slice(2)
   const s = sig.s.slice(2)
-  return `0x${r}${s}${adjustedV.toString(16).padStart(2, '0')}`
+  // sig.v is already 27 or 28 from ethers SigningKey — use as-is.
+  return `0x${r}${s}${sig.v.toString(16).padStart(2, '0')}`
 }
 
 export interface SafeTxParams {
