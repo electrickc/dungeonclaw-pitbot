@@ -20,7 +20,9 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # Pre-existing janus-starter-bot package was created manually and
+          # isn't auto-writable by the default GITHUB_TOKEN. PAT has packages:write.
+          password: ${{ secrets.GHCR_PUSH_TOKEN }}
 
       - uses: docker/build-push-action@v5
         with:
