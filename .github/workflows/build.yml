@@ -22,16 +22,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Lowercase repository name
-        id: repo
-        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
-
       - uses: docker/build-push-action@v5
         with:
           context: .
           push: true
+          # Hardcoded image name — the repo is still 'dungeonclaw-pitbot' for
+          # historical reasons but the product is JanusDLMM, so the published
+          # image lives under the brand name. Repo URL stays untouched.
           tags: |
-            ghcr.io/${{ steps.repo.outputs.name }}:latest
-            ghcr.io/${{ steps.repo.outputs.name }}:${{ github.sha }}
+            ghcr.io/electrickc/janus-starter-bot:latest
+            ghcr.io/electrickc/janus-starter-bot:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
