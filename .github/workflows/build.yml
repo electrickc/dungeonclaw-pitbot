@@ -20,19 +20,19 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          # Pre-existing janus-starter-bot package was created manually and
-          # isn't auto-writable by the default GITHUB_TOKEN. PAT has packages:write.
-          password: ${{ secrets.GHCR_PUSH_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          # Hardcoded image name — the repo is still 'dungeonclaw-pitbot' for
-          # historical reasons but the product is JanusDLMM, so the published
-          # image lives under the brand name. Repo URL stays untouched.
+          # Publishes to ghcr.io/electrickc/dungeonclaw-pitbot — the repo-derived
+          # GHCR package that the default GITHUB_TOKEN can write to. The legacy
+          # janus-starter-bot package was created manually and would need
+          # GHCR_PUSH_TOKEN to push to it (not currently configured). Swap the
+          # tag back to janus-starter-bot once that PAT is added to repo secrets.
           tags: |
-            ghcr.io/electrickc/janus-starter-bot:latest
-            ghcr.io/electrickc/janus-starter-bot:${{ github.sha }}
+            ghcr.io/electrickc/dungeonclaw-pitbot:latest
+            ghcr.io/electrickc/dungeonclaw-pitbot:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
