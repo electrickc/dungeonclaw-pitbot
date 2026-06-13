@@ -1,6 +1,6 @@
 {
   "name": "janus-starter-bot",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": true,
   "description": "Multi-tenant DLMM bot for the JanusDLMM platform. TEE-deployed inside SecretVM, signs Safe txs to manage LB v2.0 positions on Base.",
   "main": "dist/index.js",

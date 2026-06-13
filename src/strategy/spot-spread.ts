@@ -18,24 +18,19 @@ export class SpotSpreadStrategy implements Strategy {
   }
 
   plan(input: PlanInput): MintPlan {
-    const { activeBin, xAvailable, yAvailable, binStep } = input
+    const { activeBin, xAvailable, yAvailable } = input
     const { binCount, binsAbove, binsBelow } = this.cfg
 
-    // One-sided fallback: <1% of total *value* (not raw wei). For asset pairs
-    // where one token is ~10^10 more valuable per wei than the other (e.g.
-    // DCLAW/WETH), raw-wei comparison always picks the bulkier side, so we
-    // convert X→Y via the LB v2.0 bin price: price = (1 + binStep/10000)^(id - 2^23).
-    // Number-precision is fine here because we only need a 1% threshold, not
-    // exact arithmetic.
-    const PRICE_CENTER = 8388608 // 2^23 — LB v2.0 bin where price = 1
-    const priceXinY = Math.pow(1 + binStep / 10000, activeBin - PRICE_CENTER)
-    const xAsY = Number(xAvailable) * priceXinY
-    const yAsY = Number(yAvailable)
-    const totalY = xAsY + yAsY
-    const xRatio = totalY === 0 ? 0 : (xAsY / totalY) * 100
-    const yRatio = totalY === 0 ? 0 : (yAsY / totalY) * 100
-    const oneSidedY = xRatio < 1
-    const oneSidedX = yRatio < 1
+    // Intent-based fallback: two-sided unless one side is too small for every
+    // assigned bin to receive ≥1 wei after uniform distribution. LB v2.0 mint
+    // reverts on bins that mint zero shares, so we have to ensure each per-bin
+    // share is non-zero. Compare value-aware ratios is the WRONG model here —
+    // the LB pair's implied bin price is often disconnected from external
+    // market price (especially when the pair is thinly funded), and the user's
+    // intent with a spot-spread deposit is "use both tokens proportionally to
+    // what's in the Safe", not "convert to a common unit by the broken bin price".
+    const oneSidedY = xAvailable < BigInt(binsAbove)
+    const oneSidedX = yAvailable < BigInt(binsBelow)
 
     // Build bin id list: binsAbove bins strictly above active, then binsBelow bins strictly below.
     // Skip i=0 (the active bin itself) so we get exactly binsAbove + binsBelow = binCount entries.

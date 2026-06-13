@@ -102,21 +102,34 @@ describe('SpotSpreadStrategy.plan', () => {
     }
   })
 
-  // Price-aware ratio: with active bin far below 2^23 (cheap X) and binStep 240,
-  // 6.9M X tokens are worth ~5e-12 Y each — vastly less than 0.013 Y.
-  // Raw-wei comparison would call this oneSidedX (X dominates by count). The
-  // correct, price-aware answer is oneSidedY (Y dominates by value).
-  it('value-aware: low-priced X with small high-priced Y is oneSidedY, not oneSidedX', () => {
+  // Intent-based: the bot serves whatever's in the Safe. As long as both sides
+  // have ≥ binsAbove/binsBelow wei (so every assigned bin gets ≥1 wei), we go
+  // two-sided regardless of relative VALUE. Implied bin price can be wildly
+  // disconnected from external market price on thinly-funded pairs — we don't
+  // let the broken bin price dictate liquidity provision.
+  it('intent-based: both sides non-trivial → two-sided, even at extreme bin-price imbalance', () => {
     const strat = new SpotSpreadStrategy({ binCount: 20, binsAbove: 10, binsBelow: 10 })
     const plan = strat.plan({
-      activeBin: 8387515, // ~1093 below center → price ~5e-12 Y/X
+      activeBin: 8387515,
       binStep: 240,
-      xAvailable: 6_900_000n * 10n ** 18n, // 6.9M X
-      yAvailable: 13_000_000_000_000_000n, // 0.013 Y
+      xAvailable: 6_900_000n * 10n ** 18n, // 6.9M DCLAW
+      yAvailable: 13_000_000_000_000_000n, // 0.013 WETH
     })
-    expect(plan.amountX).toBe(0n)
+    expect(plan.amountX).toBe(6_900_000n * 10n ** 18n)
     expect(plan.amountY).toBe(13_000_000_000_000_000n)
-    for (const id of plan.binIds) expect(id).toBeLessThan(8387515)
+    expect(plan.binIds.length).toBe(20)
+  })
+
+  it('intent-based: side with <binCount wei rounds to phantom bins → one-sided fallback', () => {
+    const strat = new SpotSpreadStrategy({ binCount: 20, binsAbove: 10, binsBelow: 10 })
+    const planXDust = strat.plan({
+      activeBin: 8388608,
+      binStep: 240,
+      xAvailable: 5n, // less than binsAbove=10 → can't give every bin ≥1 wei
+      yAvailable: 1_000_000_000_000_000_000n,
+    })
+    expect(planXDust.amountX).toBe(0n)
+    expect(planXDust.amountY).toBe(1_000_000_000_000_000_000n)
   })
 })
 
