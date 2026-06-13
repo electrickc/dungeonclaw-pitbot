@@ -17,6 +17,8 @@ export interface PlanInput {
   activeBin: number
   xAvailable: bigint
   yAvailable: bigint
+  /** LB v2.0 bin step (basis points). Needed for price-aware ratio decisions. */
+  binStep: number
 }
 
 /** Bots use the Strategy interface to decide what to mint. Pure functions. */

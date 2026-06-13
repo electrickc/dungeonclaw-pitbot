@@ -245,6 +245,7 @@ async function operationalTick(sync: SyncResponse) {
         activeBin: updatedSnap.activeBin,
         xAvailable: updatedSnap.safeXBalance,
         yAvailable: updatedSnap.safeYBalance,
+        binStep: updatedSnap.binStep,
       })
       const receipt = await tx.mint(plan)
       const newCenter = Math.round(plan.binIds.reduce((a, b) => a + b, 0) / plan.binIds.length)

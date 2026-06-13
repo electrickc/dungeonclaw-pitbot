@@ -18,15 +18,24 @@ export class SpotSpreadStrategy implements Strategy {
   }
 
   plan(input: PlanInput): MintPlan {
-    const { activeBin, xAvailable, yAvailable } = input
+    const { activeBin, xAvailable, yAvailable, binStep } = input
     const { binCount, binsAbove, binsBelow } = this.cfg
 
-    // One-sided fallback: if one side is <1% of total value, mint pure other side.
-    const totalValue = xAvailable + yAvailable
-    const xRatio = totalValue === 0n ? 0n : (xAvailable * 100n) / totalValue
-    const yRatio = totalValue === 0n ? 0n : (yAvailable * 100n) / totalValue
-    const oneSidedY = xRatio < 1n
-    const oneSidedX = yRatio < 1n
+    // One-sided fallback: <1% of total *value* (not raw wei). For asset pairs
+    // where one token is ~10^10 more valuable per wei than the other (e.g.
+    // DCLAW/WETH), raw-wei comparison always picks the bulkier side, so we
+    // convert X→Y via the LB v2.0 bin price: price = (1 + binStep/10000)^(id - 2^23).
+    // Number-precision is fine here because we only need a 1% threshold, not
+    // exact arithmetic.
+    const PRICE_CENTER = 8388608 // 2^23 — LB v2.0 bin where price = 1
+    const priceXinY = Math.pow(1 + binStep / 10000, activeBin - PRICE_CENTER)
+    const xAsY = Number(xAvailable) * priceXinY
+    const yAsY = Number(yAvailable)
+    const totalY = xAsY + yAsY
+    const xRatio = totalY === 0 ? 0 : (xAsY / totalY) * 100
+    const yRatio = totalY === 0 ? 0 : (yAsY / totalY) * 100
+    const oneSidedY = xRatio < 1
+    const oneSidedX = yRatio < 1
 
     // Build bin id list: binsAbove bins strictly above active, then binsBelow bins strictly below.
     // Skip i=0 (the active bin itself) so we get exactly binsAbove + binsBelow = binCount entries.

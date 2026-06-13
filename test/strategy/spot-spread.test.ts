@@ -101,6 +101,23 @@ describe('SpotSpreadStrategy.plan', () => {
       expect(plan.distributionX[i] + plan.distributionY[i]).toBeGreaterThan(0n)
     }
   })
+
+  // Price-aware ratio: with active bin far below 2^23 (cheap X) and binStep 240,
+  // 6.9M X tokens are worth ~5e-12 Y each — vastly less than 0.013 Y.
+  // Raw-wei comparison would call this oneSidedX (X dominates by count). The
+  // correct, price-aware answer is oneSidedY (Y dominates by value).
+  it('value-aware: low-priced X with small high-priced Y is oneSidedY, not oneSidedX', () => {
+    const strat = new SpotSpreadStrategy({ binCount: 20, binsAbove: 10, binsBelow: 10 })
+    const plan = strat.plan({
+      activeBin: 8387515, // ~1093 below center → price ~5e-12 Y/X
+      binStep: 240,
+      xAvailable: 6_900_000n * 10n ** 18n, // 6.9M X
+      yAvailable: 13_000_000_000_000_000n, // 0.013 Y
+    })
+    expect(plan.amountX).toBe(0n)
+    expect(plan.amountY).toBe(13_000_000_000_000_000n)
+    for (const id of plan.binIds) expect(id).toBeLessThan(8387515)
+  })
 })
 
 describe('buildStrategy', () => {
