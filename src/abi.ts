@@ -6,6 +6,10 @@ export const LB_PAIR_ABI = [
   'function balanceOf(address account, uint256 id) view returns (uint256)',
   'function totalSupply(uint256 id) view returns (uint256)',
   'function getReservesAndId() view returns (uint256, uint256, uint256)',
+  // Per-bin reserves — used by safeBinPositions() in v0.1.6+ for fill detection.
+  // Missing this in v0.1.6 caused the bot to crash with
+  // "this.pair.getBin is not a function" on every reconcile.
+  'function getBin(uint24 id) view returns (uint256 reserveX, uint256 reserveY)',
   'function tokenX() view returns (address)',
   'function tokenY() view returns (address)',
   'function feeParameters() view returns (uint16, uint16, uint16, uint16, uint16, uint24, uint16, uint24, uint24, uint24, uint24, uint40)',
