@@ -65,7 +65,10 @@ export class Pool {
     return { activeBin, binStep, safeXBalance: safeX, safeYBalance: safeY }
   }
 
-  /** Scan a window of bins around activeBin and return positions where Safe holds shares. */
+  /** Scan a window of bins around activeBin and return positions where Safe holds shares.
+   *  Now populates per-bin reserveX/reserveY so the trigger can detect actual fills
+   *  (composition shift) rather than relying on "bin is below active" — which was
+   *  always true for Wall positions by design, causing a place→withdraw hot loop. */
   async safeBinPositions(activeBin: number, windowSize: number): Promise<BinPosition[]> {
     const start = activeBin - windowSize
     const end = activeBin + windowSize
@@ -73,7 +76,8 @@ export class Pool {
     for (let id = start; id <= end; id++) {
       const shares = BigInt(await this.pair.balanceOf(this.addrs.safe, id))
       if (shares > 0n) {
-        positions.push({ id, shares, reserveX: 0n, reserveY: 0n })
+        const [reserveX, reserveY] = await this.pair.getBin(id)
+        positions.push({ id, shares, reserveX: BigInt(reserveX), reserveY: BigInt(reserveY) })
       }
     }
     return positions

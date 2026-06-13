@@ -195,7 +195,19 @@ async function operationalTick(sync: SyncResponse) {
 
   const snap = await pool.snapshot()
   const positions = await pool.safeBinPositions(snap.activeBin, 50)
-  const anyBinFilled = positions.some((p) => p.id < snap.activeBin)
+  // FIXED: "fill" means swaps actually consumed our liquidity, NOT just "bin
+  // sits below active" (that was always true for Wall by design, hot-looping
+  // place→withdraw every tick). For Y-side positions (below active at mint),
+  // a fill shows up as reserveX > 0 in the bin — swaps pushed price through,
+  // converted Y to X. For X-side positions (above active) it's the inverse.
+  // Single universal heuristic: a bin shows fill if it holds BOTH tokens or
+  // the "wrong" token relative to its side.
+  const anyBinFilled = positions.some((p) => {
+    if (p.id === snap.activeBin) return false           // active bin always mixed
+    return p.id < snap.activeBin
+      ? p.reserveX > 0n   // Y-side bin filled = X appeared
+      : p.reserveY > 0n   // X-side bin filled = Y appeared
+  })
 
   const action = decide({
     activeBin: snap.activeBin,
