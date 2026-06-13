@@ -64,6 +64,43 @@ describe('SpotSpreadStrategy.plan', () => {
       }
     }
   })
+
+  // LB v2.0 mint reverts when a bin in the ids array gets neither X nor Y
+  // (a "phantom" bin). The earlier behavior of returning all 20 bins in the
+  // one-sided branches was the v0.1.7 GS013 bug; one-sided plans must
+  // contain ONLY the side actually receiving liquidity.
+  it('one-sided X plan contains no phantom bins (only above-active)', () => {
+    const strat = new SpotSpreadStrategy({ binCount: 20, binsAbove: 10, binsBelow: 10 })
+    const plan = strat.plan({
+      activeBin: 8388608,
+      xAvailable: 1_000_000_000_000_000_000n,
+      yAvailable: 1n,
+    })
+    expect(plan.binIds.length).toBe(plan.distributionX.length)
+    expect(plan.binIds.length).toBe(plan.distributionY.length)
+    expect(plan.binIds.length).toBe(10)
+    for (const id of plan.binIds) expect(id).toBeGreaterThan(8388608)
+    // No phantom bin: every id must have a nonzero distribution
+    for (let i = 0; i < plan.binIds.length; i++) {
+      expect(plan.distributionX[i] + plan.distributionY[i]).toBeGreaterThan(0n)
+    }
+  })
+
+  it('one-sided Y plan contains no phantom bins (only below-active)', () => {
+    const strat = new SpotSpreadStrategy({ binCount: 20, binsAbove: 10, binsBelow: 10 })
+    const plan = strat.plan({
+      activeBin: 8388608,
+      xAvailable: 1n,
+      yAvailable: 1_000_000_000_000_000_000n,
+    })
+    expect(plan.binIds.length).toBe(plan.distributionX.length)
+    expect(plan.binIds.length).toBe(plan.distributionY.length)
+    expect(plan.binIds.length).toBe(10)
+    for (const id of plan.binIds) expect(id).toBeLessThan(8388608)
+    for (let i = 0; i < plan.binIds.length; i++) {
+      expect(plan.distributionX[i] + plan.distributionY[i]).toBeGreaterThan(0n)
+    }
+  })
 })
 
 describe('buildStrategy', () => {

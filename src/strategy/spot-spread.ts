@@ -41,53 +41,36 @@ export class SpotSpreadStrategy implements Strategy {
     const distributionY: bigint[] = new Array(binCount).fill(0n)
 
     if (oneSidedY) {
-      // Y-only: distribute Y uniformly across binsBelow bins below active
-      const yBins = binsBelow
+      // Y-only: include ONLY bins below active. LBPair.mint reverts on
+      // "phantom" bins (both distX and distY zero), so we must filter the
+      // bin list down to just the side receiving liquidity.
+      const filteredIds = binIds.filter((id) => id < activeBin)
+      const yBins = filteredIds.length
       const per = ONE / BigInt(yBins)
-      let assigned = 0n
-      for (let i = 0; i < binCount; i++) {
-        if (binIds[i] < activeBin) {
-          distributionY[i] = per
-          assigned += per
-        }
-      }
-      // Top up last Y bin to make sum exactly ONE
-      for (let i = binCount - 1; i >= 0; i--) {
-        if (distributionY[i] > 0n) {
-          distributionY[i] += ONE - assigned
-          break
-        }
-      }
+      const distX: bigint[] = new Array(yBins).fill(0n)
+      const distY: bigint[] = new Array(yBins).fill(per)
+      distY[yBins - 1] += ONE - per * BigInt(yBins)
       return {
-        binIds,
-        distributionX,
-        distributionY,
+        binIds: filteredIds,
+        distributionX: distX,
+        distributionY: distY,
         amountX: 0n,
         amountY: yAvailable,
       }
     }
 
     if (oneSidedX) {
-      // X-only: distribute X uniformly across binsAbove bins above active
-      const xBins = binsAbove
+      // X-only: include ONLY bins above active (see oneSidedY note above).
+      const filteredIds = binIds.filter((id) => id > activeBin)
+      const xBins = filteredIds.length
       const per = ONE / BigInt(xBins)
-      let assigned = 0n
-      for (let i = 0; i < binCount; i++) {
-        if (binIds[i] > activeBin) {
-          distributionX[i] = per
-          assigned += per
-        }
-      }
-      for (let i = 0; i < binCount; i++) {
-        if (distributionX[i] > 0n) {
-          distributionX[i] += ONE - assigned
-          break
-        }
-      }
+      const distX: bigint[] = new Array(xBins).fill(per)
+      const distY: bigint[] = new Array(xBins).fill(0n)
+      distX[0] += ONE - per * BigInt(xBins)
       return {
-        binIds,
-        distributionX,
-        distributionY,
+        binIds: filteredIds,
+        distributionX: distX,
+        distributionY: distY,
         amountX: xAvailable,
         amountY: 0n,
       }
