@@ -12,6 +12,7 @@ import { decide } from './trigger'
 import { withTimeout } from './util/withTimeout'
 
 const RPC_TIMEOUT_MS = 20_000
+const RECONCILE_TIMEOUT_SECONDS = 90
 
 const cfg = loadConfig()
 const stateManager = new BotStateManager(cfg.statePath)
@@ -61,7 +62,7 @@ async function boot() {
   }
 }
 
-async function poll() {
+export async function poll() {
   console.log(`[poll] state=${stateManager.current}`)
   let sync: SyncResponse
   try {
@@ -103,6 +104,23 @@ async function poll() {
         await operationalTick(sync)
       }
       break
+    case 'RECONCILE': {
+      const elapsedSec = Math.floor(Date.now() / 1000) - stateManager.snapshot.lastTransitionTs
+      if (elapsedSec > RECONCILE_TIMEOUT_SECONDS) {
+        console.warn(`[reconcile] stuck for ${elapsedSec}s — forcing PAUSED`)
+        stateManager.transition('PAUSED', { reason: `reconcile timeout (${elapsedSec}s)` })
+        try {
+          await cp.emitEvent({
+            ts: Math.floor(Date.now() / 1000),
+            type: 'error',
+            payload: { reason: 'reconcile timeout', elapsedSec },
+          })
+        } catch (e) {
+          console.error(`[reconcile] timeout error event emit failed: ${e}`)
+        }
+      }
+      break
+    }
     case 'PAUSED':
       if (sync.status === 'operational' && !sync.killSwitch) {
         stateManager.transition('OPERATIONAL', { reason: 'resumed' })
