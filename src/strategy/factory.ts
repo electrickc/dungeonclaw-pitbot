@@ -36,15 +36,15 @@ export function buildStrategy(spec: {
       })
     case 'curve':
       return new CurveStrategy({
-        binCount: spec.knobs.binCount ?? 20,
-        binsAbove: spec.knobs.binsAbove ?? 10,
-        binsBelow: spec.knobs.binsBelow ?? 10,
+        binCount: spec.knobs.binCount ?? 10,
+        binsAbove: spec.knobs.binsAbove ?? 5,
+        binsBelow: spec.knobs.binsBelow ?? 5,
       })
     case 'bid-ask':
       return new BidAskStrategy({
-        binCount: spec.knobs.binCount ?? 20,
-        binsAbove: spec.knobs.binsAbove ?? 10,
-        binsBelow: spec.knobs.binsBelow ?? 10,
+        binCount: spec.knobs.binCount ?? 10,
+        binsAbove: spec.knobs.binsAbove ?? 5,
+        binsBelow: spec.knobs.binsBelow ?? 5,
       })
   }
 }
