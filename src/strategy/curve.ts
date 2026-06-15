@@ -8,11 +8,17 @@ export interface CurveConfig {
 
 const ONE = 10n ** 18n
 
+// Floor that lifts the outermost-bin allocation above LB v2's effective
+// min-shares-per-bin threshold (~1%). Without it, the linear taper drops
+// the outermost bin to 1.82%, sitting on LB v2's revert boundary.
+const OUTERMOST_BIAS = 3n
+
 // Bell-shape weight: linear taper. Bin closest to active gets weight `binsSide`,
 // furthest gets weight 1. weight(0) = binsSide, weight(binsSide - 1) = 1.
+// OUTERMOST_BIAS is added to every bin so the outermost always clears 2% of ONE.
 function bellWeight(distanceFromActive: number, binsSide: number): bigint {
   const w = binsSide - distanceFromActive
-  return w >= 1 ? BigInt(w) : 1n
+  return (w >= 1 ? BigInt(w) : 1n) + OUTERMOST_BIAS
 }
 
 export class CurveStrategy implements Strategy {
