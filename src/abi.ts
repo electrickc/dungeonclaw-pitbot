@@ -13,6 +13,7 @@ export const LB_PAIR_ABI = [
   'function tokenX() view returns (address)',
   'function tokenY() view returns (address)',
   'function feeParameters() view returns (uint16, uint16, uint16, uint16, uint16, uint24, uint16, uint24, uint24, uint24, uint24, uint40)',
+  'function isApprovedForAll(address account, address operator) view returns (bool)',
 ] as const
 
 // JanusHelper (atomic mint+burn wrapper)

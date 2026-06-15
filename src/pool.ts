@@ -93,5 +93,25 @@ export class Pool {
     if (!isBotOwner) {
       throw new Error(`bot wallet ${this.wallet.address} is not a Safe owner`)
     }
+    // Catch the GS013 footgun: PitBotHelper.mintAtomic does
+    //   tokenX.transferFrom(Safe, Pair, amountX)
+    //   tokenY.transferFrom(Safe, Pair, amountY)
+    // before pair.mint(). If either allowance is 0 the call reverts inside
+    // the helper and the Safe surfaces it as GS013 — opaque, easy to
+    // misread as a bin-math issue. Fail loud at reconcile instead.
+    const [allowX, allowY, lbApproved] = await Promise.all([
+      this.tokenX.allowance(this.addrs.safe, this.addrs.helper).then(BigInt),
+      this.tokenY.allowance(this.addrs.safe, this.addrs.helper).then(BigInt),
+      this.pair.isApprovedForAll(this.addrs.safe, this.addrs.helper),
+    ])
+    if (allowX === 0n) {
+      throw new Error(`Safe→helper tokenX allowance is 0 — run tokenX.approve(${this.addrs.helper}, max) from the Safe`)
+    }
+    if (allowY === 0n) {
+      throw new Error(`Safe→helper tokenY allowance is 0 — run tokenY.approve(${this.addrs.helper}, max) from the Safe`)
+    }
+    if (!lbApproved) {
+      throw new Error(`pair.isApprovedForAll(Safe, helper) is false — run pair.setApprovalForAll(${this.addrs.helper}, true) from the Safe`)
+    }
   }
 }
