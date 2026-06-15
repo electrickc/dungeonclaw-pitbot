@@ -9,6 +9,10 @@ import { SafeSigner } from './safeSigner'
 import { TxLayer } from './tx'
 import { buildStrategy, Strategy } from './strategy'
 import { decide } from './trigger'
+import { withTimeout } from './util/withTimeout'
+
+const RPC_TIMEOUT_MS = 20_000
+const RECONCILE_TIMEOUT_SECONDS = 90
 
 const cfg = loadConfig()
 const stateManager = new BotStateManager(cfg.statePath)
@@ -58,7 +62,7 @@ async function boot() {
   }
 }
 
-async function poll() {
+export async function poll() {
   console.log(`[poll] state=${stateManager.current}`)
   let sync: SyncResponse
   try {
@@ -100,6 +104,23 @@ async function poll() {
         await operationalTick(sync)
       }
       break
+    case 'RECONCILE': {
+      const elapsedSec = Math.floor(Date.now() / 1000) - stateManager.snapshot.lastTransitionTs
+      if (elapsedSec > RECONCILE_TIMEOUT_SECONDS) {
+        console.warn(`[reconcile] stuck for ${elapsedSec}s — forcing PAUSED`)
+        stateManager.transition('PAUSED', { reason: `reconcile timeout (${elapsedSec}s)` })
+        try {
+          await cp.emitEvent({
+            ts: Math.floor(Date.now() / 1000),
+            type: 'error',
+            payload: { reason: 'reconcile timeout', elapsedSec },
+          })
+        } catch (e) {
+          console.error(`[reconcile] timeout error event emit failed: ${e}`)
+        }
+      }
+      break
+    }
     case 'PAUSED':
       if (sync.status === 'operational' && !sync.killSwitch) {
         stateManager.transition('OPERATIONAL', { reason: 'resumed' })
@@ -123,64 +144,78 @@ async function poll() {
   }
 }
 
-async function reconcile(sync: SyncResponse) {
+export async function reconcile(sync: SyncResponse) {
   console.log('[reconcile] start')
+  const startMs = Date.now()
   stateManager.transition('RECONCILE', { reason: 'safe + strategy configured' })
 
   if (!sync.safeAddress || !sync.helperAddress || !sync.pairAddress || !sync.strategy) {
     throw new Error('reconcile called with incomplete sync')
   }
 
-  const wallet = ensureBotWallet()
-  console.log(`[reconcile] reading tokens via RPC ${cfg.rpcUrl.slice(0, 40)}...`)
-  const tempProvider = new ethers.JsonRpcProvider(cfg.rpcUrl)
-  const tempPair = new ethers.Contract(
-    sync.pairAddress,
-    ['function tokenX() view returns (address)', 'function tokenY() view returns (address)'],
-    tempProvider,
-  )
-  const [tokenX, tokenY] = await Promise.all([tempPair.tokenX(), tempPair.tokenY()])
-  console.log(`[reconcile] tokenX=${tokenX} tokenY=${tokenY}`)
-
-  pool = new Pool(cfg.rpcUrl, wallet.privateKey, {
-    safe: sync.safeAddress,
-    helper: sync.helperAddress,
-    pair: sync.pairAddress,
-    tokenX,
-    tokenY,
-  })
-
   try {
-    console.log('[reconcile] validating invariants')
-    await pool.validateInvariants()
-    console.log('[reconcile] invariants OK')
-  } catch (e) {
-    console.error(`[reconcile] invariant violation: ${e}`)
-    stateManager.transition('PAUSED', { reason: `invariant violation: ${e}` })
-    await cp.emitEvent({
-      ts: Math.floor(Date.now() / 1000),
-      type: 'error',
-      payload: { reason: 'invariant violation', error: String(e) },
+    const wallet = ensureBotWallet()
+    console.log(`[reconcile] reading tokens via RPC ${cfg.rpcUrl.slice(0, 40)}...`)
+    const tempProvider = new ethers.JsonRpcProvider(cfg.rpcUrl)
+    const tempPair = new ethers.Contract(
+      sync.pairAddress,
+      ['function tokenX() view returns (address)', 'function tokenY() view returns (address)'],
+      tempProvider,
+    )
+    const [tokenX, tokenY] = await withTimeout(
+      Promise.all([tempPair.tokenX(), tempPair.tokenY()]),
+      RPC_TIMEOUT_MS,
+      'tokens',
+    )
+    console.log(`[reconcile] tokenX=${tokenX} tokenY=${tokenY}`)
+
+    pool = new Pool(cfg.rpcUrl, wallet.privateKey, {
+      safe: sync.safeAddress,
+      helper: sync.helperAddress,
+      pair: sync.pairAddress,
+      tokenX,
+      tokenY,
     })
-    return
+
+    console.log('[reconcile] validating invariants')
+    await withTimeout(pool.validateInvariants(), RPC_TIMEOUT_MS, 'invariants')
+    console.log('[reconcile] invariants OK')
+
+    signer = new SafeSigner(pool.safe, pool.wallet)
+    tx = new TxLayer(pool, signer)
+    strategy = buildStrategy(sync.strategy)
+    console.log(`[reconcile] strategy=${sync.strategy.type} signer/tx layers ready`)
+
+    console.log('[reconcile] reading active bin snapshot')
+    const snap = await withTimeout(pool.snapshot(), RPC_TIMEOUT_MS, 'snapshot')
+    console.log(`[reconcile] activeBin=${snap.activeBin} — scanning ±50 bin positions`)
+    const positions = await withTimeout(
+      pool.safeBinPositions(snap.activeBin, 50),
+      RPC_TIMEOUT_MS,
+      'binPositions',
+    )
+    console.log(`[reconcile] ${positions.length} positions found`)
+    const currentCenter =
+      positions.length === 0 ? null : Math.round(positions.reduce((a, p) => a + p.id, 0) / positions.length)
+    stateManager.update({ currentCenter })
+
+    stateManager.transition('OPERATIONAL', { reason: 'reconciled' })
+    console.log(`[reconcile] done in ${Date.now() - startMs}ms`)
+    console.log('[reconcile] → OPERATIONAL')
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    console.error(`[reconcile] error: ${msg}`)
+    stateManager.transition('PAUSED', { reason: `reconcile error: ${msg}` })
+    try {
+      await cp.emitEvent({
+        ts: Math.floor(Date.now() / 1000),
+        type: 'error',
+        payload: { reason: 'reconcile error', error: msg },
+      })
+    } catch (emitErr) {
+      console.error(`[reconcile] error event emit failed: ${emitErr}`)
+    }
   }
-
-  signer = new SafeSigner(pool.safe, pool.wallet)
-  tx = new TxLayer(pool, signer)
-  strategy = buildStrategy(sync.strategy)
-  console.log(`[reconcile] strategy=${sync.strategy.type} signer/tx layers ready`)
-
-  console.log('[reconcile] reading active bin snapshot')
-  const snap = await pool.snapshot()
-  console.log(`[reconcile] activeBin=${snap.activeBin} — scanning ±50 bin positions`)
-  const positions = await pool.safeBinPositions(snap.activeBin, 50)
-  console.log(`[reconcile] ${positions.length} positions found`)
-  const currentCenter =
-    positions.length === 0 ? null : Math.round(positions.reduce((a, p) => a + p.id, 0) / positions.length)
-  stateManager.update({ currentCenter })
-
-  stateManager.transition('OPERATIONAL', { reason: 'reconciled' })
-  console.log('[reconcile] → OPERATIONAL')
 }
 
 async function operationalTick(sync: SyncResponse) {
