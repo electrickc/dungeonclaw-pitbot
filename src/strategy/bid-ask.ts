@@ -8,11 +8,18 @@ export interface BidAskConfig {
 
 const ONE = 10n ** 18n
 
-// U-shape weight: weight(i) = (distance_from_active + 1)^2.
+// Floor that lifts the innermost-bin allocation above LB v2's effective
+// min-shares-per-bin threshold (~1%). Without it, the natural (i+1)^2 weight
+// drops the innermost bin to 0.26%, and LB v2's mint reverts (surfaces as
+// Gnosis Safe GS013 from execTransaction).
+const INNERMOST_BIAS = 10n
+
+// U-shape weight: weight(i) = (distance_from_active + 1)^2 + INNERMOST_BIAS.
 // Outer bins (high distance) get heavier weight than inner bins.
+// The bias ensures the innermost bin clears LB v2's per-bin min-shares threshold.
 function uShapeWeight(distanceFromActive: number): bigint {
   const d = BigInt(distanceFromActive + 1)
-  return d * d
+  return d * d + INNERMOST_BIAS
 }
 
 export class BidAskStrategy implements Strategy {

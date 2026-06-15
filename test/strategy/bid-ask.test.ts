@@ -84,6 +84,22 @@ describe('BidAskStrategy.plan', () => {
     })
   })
 
+  it('every nonzero distribution value is at least 2% of ONE (LB v2 min-shares safety)', () => {
+    const strat = new BidAskStrategy({ binCount: 20, binsAbove: 10, binsBelow: 10 })
+    const plan = strat.plan({
+      activeBin: ACTIVE,
+      xAvailable: ONE, yAvailable: ONE,
+      binStep: 100,
+    })
+    const MIN = ONE / 50n  // 2%
+    plan.distributionX.filter((d) => d > 0n).forEach((d) => {
+      expect(d).toBeGreaterThanOrEqual(MIN)
+    })
+    plan.distributionY.filter((d) => d > 0n).forEach((d) => {
+      expect(d).toBeGreaterThanOrEqual(MIN)
+    })
+  })
+
   it('rejects mismatched binCount / binsAbove + binsBelow', () => {
     expect(() => new BidAskStrategy({ binCount: 20, binsAbove: 11, binsBelow: 10 }))
       .toThrow(/binsAbove \+ binsBelow must equal binCount/)
