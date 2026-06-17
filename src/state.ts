@@ -81,7 +81,24 @@ export class BotStateManager {
   }
 
   private persist(): void {
+    // Atomic write: serialize to a sibling .tmp file first, fsync it to flush
+    // the page cache, then rename over the canonical file. POSIX rename(2) is
+    // atomic on the same filesystem, so a crash either leaves the old file
+    // untouched or the new file fully present — never half-written. Without
+    // this, a kill/power-loss between truncate and write leaves state.json
+    // as an empty or partial blob and the next boot fails JSON.parse,
+    // taking the bot into BOOT-loop hell or losing lastRebalanceTs (which
+    // gates the rebalance cooldown — a wiped value lets the bot storm).
     fs.mkdirSync(path.dirname(this.statePath), { recursive: true })
-    fs.writeFileSync(this.statePath, JSON.stringify(this.state, null, 2))
+    const tmpPath = `${this.statePath}.tmp`
+    const payload = JSON.stringify(this.state, null, 2)
+    const fd = fs.openSync(tmpPath, 'w')
+    try {
+      fs.writeSync(fd, payload)
+      fs.fsyncSync(fd)
+    } finally {
+      fs.closeSync(fd)
+    }
+    fs.renameSync(tmpPath, this.statePath)
   }
 }

@@ -1,4 +1,12 @@
 import { ethers } from 'ethers'
+import { withTimeout } from './util/withTimeout'
+
+// Bound on `tx.wait()`. The Safe nonce read + getTransactionHash + signing
+// + execTransaction submission run in tens of ms; the wait is the only
+// part that depends on chain inclusion. 2 minutes is generous against Base's
+// 2s blocks (≈60 blocks) and short enough to surface a stuck mempool / dead
+// RPC before the main poll loop can be hung waiting on it indefinitely.
+const TX_WAIT_TIMEOUT_MS = 120_000
 
 /**
  * Signs a Safe transaction hash producing a 65-byte signature in the format
@@ -73,7 +81,15 @@ export class SafeSigner {
       params.refundReceiver,
       sig,
     )
-    const receipt = await tx.wait()
+    // Without this timeout an unresponsive RPC or a tx stuck in mempool
+    // (e.g. nonce gap, dropped from gossip) silently hangs the bot's main
+    // poll loop indefinitely. The receive of a RPCTimeoutError bubbles up
+    // to the caller which already handles it by transitioning to PAUSED.
+    const receipt = await withTimeout<ethers.TransactionReceipt | null>(
+      tx.wait(),
+      TX_WAIT_TIMEOUT_MS,
+      'execTransaction.wait',
+    )
     if (!receipt) throw new Error('no receipt')
     return receipt
   }
