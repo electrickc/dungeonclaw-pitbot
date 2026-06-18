@@ -42,7 +42,9 @@ function ensureBotWallet(): ethers.Wallet {
     botWallet = new ethers.Wallet(pk)
   } else {
     const fresh = ethers.Wallet.createRandom()
-    fs.mkdirSync(path.dirname(walletPath), { recursive: true })
+    // mode 0o700 on the parent so non-owner uids can't list / chmod-bypass
+    // the 0o600 wallet file itself. Defense-in-depth on the SecretVM TEE.
+    fs.mkdirSync(path.dirname(walletPath), { recursive: true, mode: 0o700 })
     fs.writeFileSync(walletPath, fresh.privateKey, { mode: 0o600 })
     botWallet = new ethers.Wallet(fresh.privateKey)
   }
@@ -72,10 +74,15 @@ export async function poll() {
     console.log(`[sync] ok status=${sync.status} hasSafe=${!!sync.safeAddress} hasHelper=${!!sync.helperAddress} strategy=${sync.strategy?.type}`)
   } catch (e) {
     consecutiveSyncFailures += 1
-    console.error(`[sync] failure ${consecutiveSyncFailures}: ${e}`)
+    const errMsg = e instanceof Error ? e.message : String(e)
+    console.error(`[sync] failure ${consecutiveSyncFailures}: ${errMsg}`)
     if (lastSync && consecutiveSyncFailures >= lastSync.consecutiveSyncFailureThreshold) {
       if (stateManager.current === 'OPERATIONAL') {
-        stateManager.transition('PAUSED', { reason: 'control plane unreachable' })
+        // Carry the underlying error + failure count + threshold into the
+        // reason so operators can diagnose without grepping logs.
+        stateManager.transition('PAUSED', {
+          reason: `control plane unreachable: ${errMsg} (${consecutiveSyncFailures}/${lastSync.consecutiveSyncFailureThreshold})`,
+        })
       }
     }
     return
@@ -126,12 +133,21 @@ export async function poll() {
         stateManager.transition('OPERATIONAL', { reason: 'resumed' })
         break
       }
-      // Self-heal: the most common reason for PAUSED is "bot not yet a Safe
-      // owner" — the wizard always adds the bot AFTER provision, so the bot's
-      // first reconcile races the user's addOwner signature. Retry reconcile
-      // on every poll; once the user signs addOwner, the next attempt will
-      // pass validateInvariants and we'll go OPERATIONAL.
-      if (sync.safeAddress && sync.helperAddress && sync.pairAddress && sync.strategy) {
+      // Don't fight the operator: if the control plane explicitly says
+      // "paused", skip self-heal entirely — the operator chose to stop us.
+      if (sync.status === 'paused' || sync.killSwitch) break
+      // Self-heal whitelist: only retry reconcile when the pause is a known
+      // recoverable transient ("bot not yet a Safe owner" — the wizard races
+      // bot provision and addOwner). For terminal reasons (bot_eth_low, etc.)
+      // the loop would just hammer the same failing RPC every poll and spam
+      // error events. Plus a 60s back-off so we don't burn quota.
+      const reason = stateManager.snapshot.reason.toLowerCase()
+      const SELF_HEAL_REASONS = ['not a safe owner', 'bot not yet', 'reconcile error', 'retry from paused']
+      const isSelfHealable = SELF_HEAL_REASONS.some((r) => reason.includes(r))
+      const SELF_HEAL_BACKOFF_S = 60
+      const sinceLastAttempt = (Date.now() / 1000) - stateManager.snapshot.lastTransitionTs
+      if (isSelfHealable && sinceLastAttempt >= SELF_HEAL_BACKOFF_S &&
+          sync.safeAddress && sync.helperAddress && sync.pairAddress && sync.strategy) {
         console.log('[paused] attempting recovery via reconcile')
         try {
           stateManager.transition('PENDING_SAFE_SETUP', { reason: 'retry from paused' })
@@ -169,6 +185,16 @@ export async function reconcile(sync: SyncResponse) {
     )
     console.log(`[reconcile] tokenX=${tokenX} tokenY=${tokenY}`)
 
+    // chainId assertion. Pool.provider uses `staticNetwork: true` to skip
+    // per-call chainId checks. If RPC_URL was misconfigured to a different
+    // chain at restart, the Safe's on-chain `block.chainid` would reject the
+    // sig with `GS026`/`GS013` — failure surfaces opaquely. Fail loud here.
+    const EXPECTED_CHAIN_ID = 8453n  // Base mainnet
+    const network = await withTimeout(tempProvider.getNetwork(), RPC_TIMEOUT_MS, 'getNetwork')
+    if (network.chainId !== EXPECTED_CHAIN_ID) {
+      throw new Error(`unexpected chainId ${network.chainId} (expected ${EXPECTED_CHAIN_ID} Base mainnet) — check RPC_URL`)
+    }
+
     pool = new Pool(cfg.rpcUrl, wallet.privateKey, {
       safe: sync.safeAddress,
       helper: sync.helperAddress,
@@ -195,8 +221,47 @@ export async function reconcile(sync: SyncResponse) {
       'binPositions',
     )
     console.log(`[reconcile] ${positions.length} positions found`)
-    const currentCenter =
-      positions.length === 0 ? null : Math.round(positions.reduce((a, p) => a + p.id, 0) / positions.length)
+    // Share-weighted center: a one-sided wall/bid-ask strategy distributes
+    // shares asymmetrically, so an unweighted arithmetic mean of bin IDs lands
+    // off the true mint center, which makes the very next operationalTick
+    // see a fake drift > threshold and burn the freshly-minted position.
+    // Falls back to arithmetic if every position's share is zero (defensive).
+    let currentCenter: number | null = null
+    if (positions.length > 0) {
+      const totalShares = positions.reduce((a, p) => a + (p.shares ?? 0n), 0n)
+      if (totalShares > 0n) {
+        // Math.round on a Number that came from a bigint division — bin IDs
+        // fit in uint24, totals do too for reasonable mint sizes.
+        const weightedNumerator = positions.reduce((a, p) => a + Number(p.shares ?? 0n) * p.id, 0)
+        currentCenter = Math.round(weightedNumerator / Number(totalShares))
+      } else {
+        currentCenter = Math.round(positions.reduce((a, p) => a + p.id, 0) / positions.length)
+      }
+    }
+    // Bot ETH balance gate — without ETH the bot cannot pay gas on
+    // execTransaction and every tick reverts opaquely. Catch it loud at
+    // reconcile so the control plane shows a structured 'paused: bot eth low'
+    // instead of a stream of generic reverts the operator can't act on.
+    const MIN_BOT_ETH_WEI = 500_000_000_000_000n  // 0.0005 ETH
+    try {
+      const balance = await pool.provider.getBalance(pool.wallet.address)
+      console.log(`[reconcile] bot signer balance: ${balance.toString()} wei (${pool.wallet.address})`)
+      if (balance < MIN_BOT_ETH_WEI) {
+        stateManager.transition('PAUSED', {
+          reason: `bot eth low: have ${balance.toString()} wei, need ${MIN_BOT_ETH_WEI.toString()}`,
+        })
+        try {
+          await cp.emitEvent({
+            ts: Math.floor(Date.now() / 1000),
+            type: 'error',
+            payload: { reason: 'bot_eth_low', balanceWei: balance.toString(), botAddress: pool.wallet.address },
+          })
+        } catch { /* best effort */ }
+        return
+      }
+    } catch (e) {
+      console.warn(`[reconcile] bot balance check failed: ${e}`)
+    }
     stateManager.update({ currentCenter })
 
     stateManager.transition('OPERATIONAL', { reason: 'reconciled' })
@@ -220,12 +285,37 @@ export async function reconcile(sync: SyncResponse) {
 
 async function operationalTick(sync: SyncResponse) {
   if (!pool || !tx || !strategy) {
-    stateManager.transition('PAUSED', { reason: 'operational without pool/tx/strategy' })
+    // Spell out which dependency is null so the operator doesn't have to guess.
+    const missing = [
+      pool ? null : 'pool',
+      tx ? null : 'tx',
+      strategy ? null : 'strategy',
+    ].filter(Boolean).join(',')
+    stateManager.transition('PAUSED', {
+      reason: `operational without ${missing} — module not reloaded after restart?`,
+    })
     return
   }
 
   if (sync.strategy && sync.strategy.type !== strategy.id) {
+    // Strategy shape change. The previous positions are sized for the OLD
+    // shape; the next mint will use the NEW shape's bin distribution, which
+    // can overlap or conflict with the leftover bins. PAUSE so the operator
+    // can decide whether to manually burn-and-redeploy.
+    const oldId = strategy.id
+    console.log(`[op] strategy change detected: ${oldId} → ${sync.strategy.type}`)
     strategy = buildStrategy(sync.strategy)
+    stateManager.transition('PAUSED', {
+      reason: `strategy change ${oldId} → ${sync.strategy.type}: burn old position via control plane, then resume`,
+    })
+    try {
+      await cp.emitEvent({
+        ts: Math.floor(Date.now() / 1000),
+        type: 'error',
+        payload: { reason: 'strategy_change_requires_manual_migration', from: oldId, to: sync.strategy.type },
+      })
+    } catch { /* best effort */ }
+    return
   }
 
   const snap = await pool.snapshot()
@@ -248,6 +338,7 @@ async function operationalTick(sync: SyncResponse) {
     activeBin: snap.activeBin,
     currentCenter: stateManager.snapshot.currentCenter,
     lastRebalanceTs: stateManager.snapshot.lastRebalanceTs,
+    lastRebalanceCenter: stateManager.snapshot.lastRebalanceCenter ?? null,
     nowTs: Math.floor(Date.now() / 1000),
     anyBinFilled,
     rebalanceCooldownSeconds: sync.rebalanceCooldownSeconds,
@@ -284,7 +375,11 @@ async function operationalTick(sync: SyncResponse) {
       })
       const receipt = await tx.mint(plan)
       const newCenter = Math.round(plan.binIds.reduce((a, b) => a + b, 0) / plan.binIds.length)
-      stateManager.update({ currentCenter: newCenter, lastRebalanceTs: Math.floor(Date.now() / 1000) })
+      stateManager.update({
+        currentCenter: newCenter,
+        lastRebalanceCenter: newCenter,
+        lastRebalanceTs: Math.floor(Date.now() / 1000),
+      })
       await cp.emitEvent({
         ts: Math.floor(Date.now() / 1000),
         type: action.action === 'place' ? 'place' : 'rebalance',
@@ -315,16 +410,27 @@ async function main() {
     if (e instanceof Error && e.stack) console.error(e.stack)
   }
 
-  const interval = setInterval(async () => {
-    try {
-      await poll()
-    } catch (e) {
-      console.error(`[poll] uncaught: ${e}`)
-      if (e instanceof Error && e.stack) console.error(e.stack)
-    }
-  }, (lastSync?.syncPollIntervalSeconds ?? 30) * 1000)
-
-  void interval
+  // setTimeout-recursion instead of setInterval. With setInterval, a poll
+  // that takes longer than the configured interval (typical when waiting on
+  // a Safe execTransaction receipt — up to 2 min — vs a 30s poll interval)
+  // would fire a concurrent next tick. Two ticks reading/writing the same
+  // state, both calling stateManager.transition(), both submitting txs from
+  // the same nonce → races up to and including double-mint. This pattern
+  // guarantees serial execution.
+  const pollIntervalMs = (lastSync?.syncPollIntervalSeconds ?? 30) * 1000
+  const schedule = (): void => {
+    setTimeout(async () => {
+      try {
+        await poll()
+      } catch (e) {
+        console.error(`[poll] uncaught: ${e}`)
+        if (e instanceof Error && e.stack) console.error(e.stack)
+      } finally {
+        schedule()
+      }
+    }, pollIntervalMs)
+  }
+  schedule()
 }
 
 main().catch((e) => {

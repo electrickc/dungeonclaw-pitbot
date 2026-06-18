@@ -15,6 +15,11 @@ export interface BotState {
   reason: string
   lastRebalanceTs: number
   currentCenter: number | null
+  // Center we minted around at the LAST rebalance. Used for hysteresis in
+  // `decide()` so price oscillating around the threshold doesn't ping-pong
+  // burn+mint indefinitely. Optional for backward compatibility with state.json
+  // files that pre-date this field.
+  lastRebalanceCenter?: number | null
 }
 
 // PAUSED → PENDING_SAFE_SETUP is allowed so a container restart can recover
