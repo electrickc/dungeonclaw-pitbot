@@ -24,6 +24,10 @@ const cp = new ControlPlaneClient({
 
 let consecutiveSyncFailures = 0
 let lastSync: SyncResponse | null = null
+// Hold-reason log throttle. Hysteresis can hold for hours during ranging
+// markets — logging every tick spams ~2880 lines/day per pool.
+let lastTickReason = ''
+let holdLogCounter = 0
 let pool: Pool | null = null
 let signer: SafeSigner | null = null
 let tx: TxLayer | null = null
@@ -81,7 +85,7 @@ export async function poll() {
         // Carry the underlying error + failure count + threshold into the
         // reason so operators can diagnose without grepping logs.
         stateManager.transition('PAUSED', {
-          reason: `control plane unreachable: ${errMsg} (${consecutiveSyncFailures}/${lastSync.consecutiveSyncFailureThreshold})`,
+          reason: `recoverable:control plane unreachable: ${errMsg} (${consecutiveSyncFailures}/${lastSync.consecutiveSyncFailureThreshold})`,
         })
       }
     }
@@ -115,7 +119,7 @@ export async function poll() {
       const elapsedSec = Math.floor(Date.now() / 1000) - stateManager.snapshot.lastTransitionTs
       if (elapsedSec > RECONCILE_TIMEOUT_SECONDS) {
         console.warn(`[reconcile] stuck for ${elapsedSec}s — forcing PAUSED`)
-        stateManager.transition('PAUSED', { reason: `reconcile timeout (${elapsedSec}s)` })
+        stateManager.transition('PAUSED', { reason: `recoverable:reconcile timeout (${elapsedSec}s)` })
         try {
           await cp.emitEvent({
             ts: Math.floor(Date.now() / 1000),
@@ -130,27 +134,34 @@ export async function poll() {
     }
     case 'PAUSED':
       if (sync.status === 'operational' && !sync.killSwitch) {
+        // On resume, rebuild the strategy from the control plane's CURRENT
+        // value. This catches the case where the operator paused us via
+        // strategy change, then either confirmed or reverted before resuming
+        // — either way, we adopt whatever the control plane says NOW.
+        if (sync.strategy && strategy && sync.strategy.type !== strategy.id) {
+          console.log(`[paused→resume] adopting strategy ${strategy.id} → ${sync.strategy.type}`)
+          strategy = buildStrategy(sync.strategy)
+        }
         stateManager.transition('OPERATIONAL', { reason: 'resumed' })
         break
       }
       // Don't fight the operator: if the control plane explicitly says
       // "paused", skip self-heal entirely — the operator chose to stop us.
       if (sync.status === 'paused' || sync.killSwitch) break
-      // Self-heal whitelist: only retry reconcile when the pause is a known
-      // recoverable transient ("bot not yet a Safe owner" — the wizard races
-      // bot provision and addOwner). For terminal reasons (bot_eth_low, etc.)
-      // the loop would just hammer the same failing RPC every poll and spam
-      // error events. Plus a 60s back-off so we don't burn quota.
-      const reason = stateManager.snapshot.reason.toLowerCase()
-      const SELF_HEAL_REASONS = ['not a safe owner', 'bot not yet', 'reconcile error', 'retry from paused']
-      const isSelfHealable = SELF_HEAL_REASONS.some((r) => reason.includes(r))
+      // Self-heal gate: only retry reconcile when the pause reason was
+      // explicitly tagged `recoverable:` at emit time. Substring matching
+      // on "reconcile error" was too broad — terminal errors (wrong chainId,
+      // Safe owner mismatch, missing approvals) ALSO carry that prefix and
+      // would be self-healed every 60s, burning RPC quota.
+      const reason = stateManager.snapshot.reason
+      const isSelfHealable = reason.startsWith('recoverable:')
       const SELF_HEAL_BACKOFF_S = 60
       const sinceLastAttempt = (Date.now() / 1000) - stateManager.snapshot.lastTransitionTs
       if (isSelfHealable && sinceLastAttempt >= SELF_HEAL_BACKOFF_S &&
           sync.safeAddress && sync.helperAddress && sync.pairAddress && sync.strategy) {
         console.log('[paused] attempting recovery via reconcile')
         try {
-          stateManager.transition('PENDING_SAFE_SETUP', { reason: 'retry from paused' })
+          stateManager.transition('PENDING_SAFE_SETUP', { reason: 'recoverable:retry from paused' })
           await reconcile(sync)
         } catch (e) {
           console.error(`[paused] recovery attempt failed: ${e}`)
@@ -270,7 +281,21 @@ export async function reconcile(sync: SyncResponse) {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     console.error(`[reconcile] error: ${msg}`)
-    stateManager.transition('PAUSED', { reason: `reconcile error: ${msg}` })
+    // Classify by error message. Terminal config errors (wrong chainId,
+    // helper bound to wrong Safe, missing approvals) should NOT self-heal —
+    // they'd hammer RPC every 60s for free. Two recoverable cases:
+    //   1. Bot wallet not yet a Safe owner (wizard races provision + addOwner).
+    //   2. Generic RPC/network blips (timeouts, ECONNRESET, etc.).
+    const lower = msg.toLowerCase()
+    const isRecoverable =
+      lower.includes('is not a safe owner') ||
+      lower.includes('timeout') ||
+      lower.includes('econnreset') ||
+      lower.includes('socket') ||
+      lower.includes('network') ||
+      lower.includes('etimedout')
+    const reasonPrefix = isRecoverable ? 'recoverable:reconcile error:' : 'reconcile error:'
+    stateManager.transition('PAUSED', { reason: `${reasonPrefix} ${msg}` })
     try {
       await cp.emitEvent({
         ts: Math.floor(Date.now() / 1000),
@@ -302,9 +327,13 @@ async function operationalTick(sync: SyncResponse) {
     // shape; the next mint will use the NEW shape's bin distribution, which
     // can overlap or conflict with the leftover bins. PAUSE so the operator
     // can decide whether to manually burn-and-redeploy.
+    //
+    // Defer the in-memory strategy swap until AFTER the operator resumes.
+    // If we rebuild here and the operator reverts the change before resuming,
+    // the next tick sees in-memory strategy.id matching the reverted type
+    // and no longer detects a change — surprising no-op.
     const oldId = strategy.id
     console.log(`[op] strategy change detected: ${oldId} → ${sync.strategy.type}`)
-    strategy = buildStrategy(sync.strategy)
     stateManager.transition('PAUSED', {
       reason: `strategy change ${oldId} → ${sync.strategy.type}: burn old position via control plane, then resume`,
     })
@@ -345,7 +374,16 @@ async function operationalTick(sync: SyncResponse) {
     rebalanceBinsThreshold: sync.strategy?.knobs.rebalanceBinsThreshold ?? 2,
   })
 
-  console.log(`[tick] active=${snap.activeBin} action=${action.action} reason=${action.reason}`)
+  // Throttle hold-reason logging: hysteresis can hold for hours during
+  // ranging markets; logging every 30s tick = 2880 lines/day per pool.
+  // Log transitions and non-hold actions every tick; log hold-with-same-
+  // reason only every 10 ticks (~5 min).
+  const reasonChanged = action.reason !== lastTickReason
+  lastTickReason = action.reason
+  if (action.action !== 'hold' || reasonChanged || ++holdLogCounter >= 10) {
+    if (action.action === 'hold' && !reasonChanged) holdLogCounter = 0
+    console.log(`[tick] active=${snap.activeBin} action=${action.action} reason=${action.reason}`)
+  }
 
   if (action.action === 'hold') return
 
