@@ -212,7 +212,7 @@ export async function reconcile(sync: SyncResponse) {
     // Build the chain adapter. Picks EvmAdapter or SolanaAdapter based on
     // `cfg.chainKind`. The adapter encapsulates all chain-specific signing,
     // RPC, and contract decoding — the rest of reconcile is chain-agnostic.
-    chain = createChainAdapter({
+    chain = await createChainAdapter({
       kind: cfg.chainKind,
       rpcUrl: cfg.rpcUrl,
       botPrivateKey: wallet.privateKey,
