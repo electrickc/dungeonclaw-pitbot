@@ -4,9 +4,8 @@ import path from 'node:path'
 import { loadConfig } from './config'
 import { ControlPlaneClient, SyncResponse } from './controlPlane'
 import { BotStateManager } from './state'
-import { Pool } from './pool'
-import { SafeSigner } from './safeSigner'
-import { TxLayer } from './tx'
+import { createChainAdapter } from './chain/factory'
+import type { ChainAdapter } from './chain/types'
 import { buildStrategy, Strategy } from './strategy'
 import { decide } from './trigger'
 import { withTimeout } from './util/withTimeout'
@@ -28,9 +27,11 @@ let lastSync: SyncResponse | null = null
 // markets — logging every tick spams ~2880 lines/day per pool.
 let lastTickReason = ''
 let holdLogCounter = 0
-let pool: Pool | null = null
-let signer: SafeSigner | null = null
-let tx: TxLayer | null = null
+// Chain-agnostic adapter — replaces the previous (pool, signer, tx) triplet.
+// Reconcile picks an EvmAdapter or SolanaAdapter via `createChainAdapter`
+// based on `cfg.chainKind`. The strategy/trigger never touch chain-specific
+// primitives — they consume the adapter's `snapshot()` / `mint()` / etc.
+let chain: ChainAdapter | null = null
 let strategy: Strategy | null = null
 
 // Bot key — generated once on first boot, persisted next to state.json on the
@@ -182,52 +183,69 @@ export async function reconcile(sync: SyncResponse) {
 
   try {
     const wallet = ensureBotWallet()
-    console.log(`[reconcile] reading tokens via RPC ${cfg.rpcUrl.slice(0, 40)}...`)
-    const tempProvider = new ethers.JsonRpcProvider(cfg.rpcUrl)
-    const tempPair = new ethers.Contract(
-      sync.pairAddress,
-      ['function tokenX() view returns (address)', 'function tokenY() view returns (address)'],
-      tempProvider,
-    )
-    const [tokenX, tokenY] = await withTimeout(
-      Promise.all([tempPair.tokenX(), tempPair.tokenY()]),
-      RPC_TIMEOUT_MS,
-      'tokens',
-    )
+
+    // Token discovery: read tokenX/tokenY off-chain from the pair account.
+    // EVM uses TJ LB v2's `tokenX()` / `tokenY()` view functions; Solana
+    // would read the Meteora pool account directly. Inlined per-chain
+    // here pre-adapter because the adapter constructor needs the resolved
+    // addresses. Phase B: move into SolanaAdapter's own bootstrap path.
+    let tokenX: string, tokenY: string
+    if (cfg.chainKind === 'evm') {
+      console.log(`[reconcile] reading tokens via EVM RPC ${cfg.rpcUrl.slice(0, 40)}...`)
+      const tempProvider = new ethers.JsonRpcProvider(cfg.rpcUrl)
+      const tempPair = new ethers.Contract(
+        sync.pairAddress,
+        ['function tokenX() view returns (address)', 'function tokenY() view returns (address)'],
+        tempProvider,
+      )
+      ;[tokenX, tokenY] = await withTimeout(
+        Promise.all([tempPair.tokenX(), tempPair.tokenY()]),
+        RPC_TIMEOUT_MS,
+        'tokens',
+      )
+    } else {
+      // Phase B: Solana token discovery via Meteora pool account read.
+      throw new Error('Solana token discovery not yet implemented (Phase B)')
+    }
     console.log(`[reconcile] tokenX=${tokenX} tokenY=${tokenY}`)
 
-    // chainId assertion. Pool.provider uses `staticNetwork: true` to skip
-    // per-call chainId checks. If RPC_URL was misconfigured to a different
-    // chain at restart, the Safe's on-chain `block.chainid` would reject the
-    // sig with `GS026`/`GS013` — failure surfaces opaquely. Fail loud here.
-    const EXPECTED_CHAIN_ID = 8453n  // Base mainnet
-    const network = await withTimeout(tempProvider.getNetwork(), RPC_TIMEOUT_MS, 'getNetwork')
-    if (network.chainId !== EXPECTED_CHAIN_ID) {
-      throw new Error(`unexpected chainId ${network.chainId} (expected ${EXPECTED_CHAIN_ID} Base mainnet) — check RPC_URL`)
-    }
-
-    pool = new Pool(cfg.rpcUrl, wallet.privateKey, {
-      safe: sync.safeAddress,
-      helper: sync.helperAddress,
-      pair: sync.pairAddress,
-      tokenX,
-      tokenY,
+    // Build the chain adapter. Picks EvmAdapter or SolanaAdapter based on
+    // `cfg.chainKind`. The adapter encapsulates all chain-specific signing,
+    // RPC, and contract decoding — the rest of reconcile is chain-agnostic.
+    chain = createChainAdapter({
+      kind: cfg.chainKind,
+      rpcUrl: cfg.rpcUrl,
+      botPrivateKey: wallet.privateKey,
+      addrs: {
+        pair: sync.pairAddress,
+        helper: sync.helperAddress,
+        custody: sync.safeAddress,
+        tokenX,
+        tokenY,
+      },
     })
 
+    // chainId assertion via adapter. Each adapter knows its expected chain
+    // (8453 for EVM Base; 'solana-mainnet' for Solana) and exposes
+    // `getChainId()` that throws or returns the live value. Comparing
+    // against the adapter's static `chainId` catches RPC misconfig early.
+    const liveChainId = await withTimeout(chain.getChainId(), RPC_TIMEOUT_MS, 'getChainId')
+    if (liveChainId !== chain.chainId) {
+      throw new Error(`unexpected chainId ${liveChainId} (expected ${chain.chainId}) — check RPC_URL`)
+    }
+
     console.log('[reconcile] validating invariants')
-    await withTimeout(pool.validateInvariants(), RPC_TIMEOUT_MS, 'invariants')
+    await withTimeout(chain.validateInvariants(), RPC_TIMEOUT_MS, 'invariants')
     console.log('[reconcile] invariants OK')
 
-    signer = new SafeSigner(pool.safe, pool.wallet)
-    tx = new TxLayer(pool, signer)
     strategy = buildStrategy(sync.strategy)
-    console.log(`[reconcile] strategy=${sync.strategy.type} signer/tx layers ready`)
+    console.log(`[reconcile] strategy=${sync.strategy.type} adapter=${chain.kind} ready`)
 
     console.log('[reconcile] reading active bin snapshot')
-    const snap = await withTimeout(pool.snapshot(), RPC_TIMEOUT_MS, 'snapshot')
+    const snap = await withTimeout(chain.snapshot(), RPC_TIMEOUT_MS, 'snapshot')
     console.log(`[reconcile] activeBin=${snap.activeBin} — scanning ±50 bin positions`)
     const positions = await withTimeout(
-      pool.safeBinPositions(snap.activeBin, 50),
+      chain.safeBinPositions(snap.activeBin, 50),
       RPC_TIMEOUT_MS,
       'binPositions',
     )
@@ -249,23 +267,27 @@ export async function reconcile(sync: SyncResponse) {
         currentCenter = Math.round(positions.reduce((a, p) => a + p.id, 0) / positions.length)
       }
     }
-    // Bot ETH balance gate — without ETH the bot cannot pay gas on
-    // execTransaction and every tick reverts opaquely. Catch it loud at
-    // reconcile so the control plane shows a structured 'paused: bot eth low'
-    // instead of a stream of generic reverts the operator can't act on.
-    const MIN_BOT_ETH_WEI = 500_000_000_000_000n  // 0.0005 ETH
+    // Bot native-gas balance gate. EVM: 0.0005 ETH ≈ ~100 rebalances at
+    // typical Base gas; Solana: ~0.005 SOL covers comparable priority fees.
+    // Without enough balance the bot can't pay gas and every tick reverts
+    // opaquely. Catch loud at reconcile so the control plane sees a
+    // structured `bot_eth_low` (or `bot_sol_low`) instead of opaque reverts.
+    const MIN_BOT_GAS = chain.kind === 'evm'
+      ? 500_000_000_000_000n   // 0.0005 ETH
+      : 5_000_000n             // 0.005 SOL (1 SOL = 1e9 lamports)
     try {
-      const balance = await pool.provider.getBalance(pool.wallet.address)
-      console.log(`[reconcile] bot signer balance: ${balance.toString()} wei (${pool.wallet.address})`)
-      if (balance < MIN_BOT_ETH_WEI) {
+      const balance = await chain.getBotBalance()
+      console.log(`[reconcile] bot signer balance: ${balance.toString()} (${chain.botAddress})`)
+      if (balance < MIN_BOT_GAS) {
+        const reason = chain.kind === 'evm' ? 'bot_eth_low' : 'bot_sol_low'
         stateManager.transition('PAUSED', {
-          reason: `bot eth low: have ${balance.toString()} wei, need ${MIN_BOT_ETH_WEI.toString()}`,
+          reason: `${reason}: have ${balance.toString()}, need ${MIN_BOT_GAS.toString()}`,
         })
         try {
           await cp.emitEvent({
             ts: Math.floor(Date.now() / 1000),
             type: 'error',
-            payload: { reason: 'bot_eth_low', balanceWei: balance.toString(), botAddress: pool.wallet.address },
+            payload: { reason, balance: balance.toString(), botAddress: chain.botAddress },
           })
         } catch { /* best effort */ }
         return
@@ -309,11 +331,10 @@ export async function reconcile(sync: SyncResponse) {
 }
 
 async function operationalTick(sync: SyncResponse) {
-  if (!pool || !tx || !strategy) {
+  if (!chain || !strategy) {
     // Spell out which dependency is null so the operator doesn't have to guess.
     const missing = [
-      pool ? null : 'pool',
-      tx ? null : 'tx',
+      chain ? null : 'chain',
       strategy ? null : 'strategy',
     ].filter(Boolean).join(',')
     stateManager.transition('PAUSED', {
@@ -347,8 +368,8 @@ async function operationalTick(sync: SyncResponse) {
     return
   }
 
-  const snap = await pool.snapshot()
-  const positions = await pool.safeBinPositions(snap.activeBin, 50)
+  const snap = await chain.snapshot()
+  const positions = await chain.safeBinPositions(snap.activeBin, 50)
   // FIXED: "fill" means swaps actually consumed our liquidity, NOT just "bin
   // sits below active" (that was always true for Wall by design, hot-looping
   // place→withdraw every tick). For Y-side positions (below active at mint),
@@ -391,7 +412,7 @@ async function operationalTick(sync: SyncResponse) {
     if (action.action === 'withdraw_filled') {
       const ids = positions.map((p) => p.id)
       const shares = positions.map((p) => p.shares)
-      const receipt = await tx.burn(ids, shares)
+      const receipt = await chain.burn(ids, shares)
       stateManager.update({ currentCenter: null, lastRebalanceTs: Math.floor(Date.now() / 1000) })
       await cp.emitEvent({
         ts: Math.floor(Date.now() / 1000),
@@ -402,16 +423,16 @@ async function operationalTick(sync: SyncResponse) {
       if (positions.length > 0) {
         const ids = positions.map((p) => p.id)
         const shares = positions.map((p) => p.shares)
-        await tx.burn(ids, shares)
+        await chain.burn(ids, shares)
       }
-      const updatedSnap = await pool.snapshot()
+      const updatedSnap = await chain.snapshot()
       const plan = strategy.plan({
         activeBin: updatedSnap.activeBin,
         xAvailable: updatedSnap.safeXBalance,
         yAvailable: updatedSnap.safeYBalance,
         binStep: updatedSnap.binStep,
       })
-      const receipt = await tx.mint(plan)
+      const receipt = await chain.mint(plan)
       const newCenter = Math.round(plan.binIds.reduce((a, b) => a + b, 0) / plan.binIds.length)
       stateManager.update({
         currentCenter: newCenter,
