@@ -26,6 +26,20 @@ export interface Strategy {
   readonly id: 'spot-spread' | 'spot-wide' | 'wall' | 'spot-concentrated' | 'curve' | 'bid-ask'
 
   plan(input: PlanInput): MintPlan
+
+  /**
+   * Recover the drift anchor (the activeBin the position was built around)
+   * from a set of held bin IDs. Used ONLY on restart, when the in-memory
+   * anchor is lost and we must reconstruct it from on-chain positions.
+   *
+   * Drift is measured as |activeBin - anchor|. The anchor is the activeBin at
+   * mint time, NOT the geometric centroid of the bins — for asymmetric shapes
+   * (wall, bid-ask) the centroid is deliberately offset from active, so using
+   * it as the anchor makes drift permanently exceed threshold and hot-loops
+   * rebalance. Symmetric strategies may omit this; the caller falls back to the
+   * share-weighted centroid, which equals the anchor for symmetric layouts.
+   */
+  anchorBin?(binIds: number[]): number
 }
 
 export { buildStrategy } from './factory'

@@ -13,6 +13,16 @@ export interface DecideInput {
   // current center repeatedly burns + remints across the same boundary,
   // draining gas + LP fees. May be null for backward compatibility.
   lastRebalanceCenter?: number | null
+  // Active bin observed on the PREVIOUS tick. Used by the sudden-jump
+  // manipulation guard to measure how far price moved in one poll interval.
+  // null on the first tick (no prior observation → guard is inert).
+  lastObservedActiveBin?: number | null
+  // Max bins the active bin may move in a single poll before a capital-
+  // committing mint is deferred one tick to confirm the move is real. Computed
+  // per-pair from a price-% threshold and the pair's binStep so it means the
+  // same thing on every market regardless of bin width. Defaults to Infinity
+  // (guard off) when omitted, preserving legacy callers.
+  manipulationJumpBins?: number
 }
 
 export interface DecideOutput {
@@ -31,7 +41,27 @@ export function decide(opts: DecideInput): DecideOutput {
   const elapsed = opts.nowTs - opts.lastRebalanceTs
   const cooldownExpired = elapsed >= 0 && elapsed >= opts.rebalanceCooldownSeconds
 
+  // Sudden-jump manipulation guard. If the active bin moved more than
+  // `manipulationJumpBins` since the last poll, defer any capital-committing
+  // mint (place or reposition) by one tick. Rationale: a flash-loan price shove
+  // is atomic — it reverts in the same block, long before our next ~30s poll,
+  // so we never even see it. To actually move our liquidity an attacker must
+  // HOLD the manipulation across polls with real capital, which is costly and
+  // self-arbitraging. Deferring one tick means a genuine sharp move simply
+  // confirms next poll (jump shrinks to ~0 once price settles) and proceeds,
+  // while a transient spike is gone by the next tick and never triggers a mint.
+  // Fills (withdraw_filled) are composition-based and always safe to action, so
+  // they intentionally bypass this guard. Omitted field ⇒ Infinity ⇒ inert.
+  const jumpLimit = opts.manipulationJumpBins ?? Infinity
+  const jump = opts.lastObservedActiveBin == null
+    ? 0
+    : Math.abs(opts.activeBin - opts.lastObservedActiveBin)
+  const suspiciousJump = jump > jumpLimit
+
   if (opts.currentCenter === null) {
+    if (suspiciousJump) {
+      return { action: 'hold', reason: `active jumped ${jump} > ${jumpLimit} bins this poll — deferring initial place to confirm (manipulation guard)` }
+    }
     return { action: 'place', reason: 'no position present' }
   }
 
@@ -50,6 +80,9 @@ export function decide(opts: DecideInput): DecideOutput {
       if (moveFromLast <= opts.rebalanceBinsThreshold) {
         return { action: 'hold', reason: `drift ${drift} > threshold but move from last rebalance ${moveFromLast} ≤ threshold (hysteresis)` }
       }
+    }
+    if (suspiciousJump) {
+      return { action: 'hold', reason: `drift ${drift} > threshold but active jumped ${jump} > ${jumpLimit} bins this poll — deferring reposition to confirm (manipulation guard)` }
     }
     if (!cooldownExpired) return { action: 'hold', reason: 'drift exceeds threshold but cooldown active' }
     return { action: 'reposition', reason: `drift ${drift} > threshold ${opts.rebalanceBinsThreshold}` }

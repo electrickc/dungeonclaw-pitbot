@@ -172,6 +172,11 @@ export class SolanaAdapter implements ChainAdapter {
     return BigInt(lamports)
   }
 
+  async ensureApprovals(): Promise<void> {
+    // Solana uses token-account authority model — no ERC-20 allowance concept.
+    // Token accounts are pre-created with fixed owner (custody); no runtime approvals needed.
+  }
+
   async validateInvariants(): Promise<void> {
     // Phase B: pool + custody existence. Squads multisig owner check + Meteora
     // helper PDA approval check land in Phase C once the Anchor program ships.

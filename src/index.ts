@@ -12,6 +12,37 @@ import { withTimeout } from './util/withTimeout'
 
 const RPC_TIMEOUT_MS = 20_000
 const RECONCILE_TIMEOUT_SECONDS = 90
+// Per-tick bin scan half-width. Normal price motion between ticks stays well
+// inside this; kept small because safeBinPositions does one balanceOf per bin.
+const RECONCILE_SCAN_WINDOW = 50
+// One-time restart fallback half-width, used ONLY when the ±50 sweep finds
+// nothing — covers a large price gap during downtime so an existing position
+// isn't missed and double-minted. ~2× the cost of a normal scan, paid rarely.
+const RECONCILE_WIDE_SCAN_WINDOW = 200
+// Consecutive failed mints (e.g. active-bin front-run reverts) before the bot
+// stops retrying and pauses for an operator. Prevents an attacker from griefing
+// a burned-but-not-reminted position into an unbounded idle-capital retry loop.
+const MAX_CONSECUTIVE_MINT_FAILURES = 3
+// Single-poll price move (as a fraction) beyond which a mint is deferred one
+// tick by the manipulation guard. Expressed in price terms so it means the same
+// thing on every pair regardless of binStep; converted to a bin count per-pool
+// via binStepToJumpBins(). Operators can override per pool with the
+// `manipulationJumpBins` strategy knob.
+const MANIPULATION_JUMP_PCT = 0.2 // 20% in one ~30s poll = suspicious
+
+/**
+ * Convert the price-% manipulation threshold into a bin count for a given
+ * binStep. One bin is a (1 + binStep/1e4) price ratio, so N bins ≈ that ratio
+ * to the Nth power; invert to get the bins that correspond to a MANIPULATION_
+ * JUMP_PCT move. Floors at 3 so tiny-binStep pairs still tolerate a few bins of
+ * ordinary noise, and guards against a zero/negative binStep.
+ */
+function binStepToJumpBins(binStep: number): number {
+  if (!Number.isFinite(binStep) || binStep <= 0) return Infinity
+  const perBin = Math.log(1 + binStep / 10_000)
+  const bins = Math.ceil(Math.log(1 + MANIPULATION_JUMP_PCT) / perBin)
+  return Math.max(3, bins)
+}
 
 const cfg = loadConfig()
 const stateManager = new BotStateManager(cfg.statePath)
@@ -27,6 +58,14 @@ let lastSync: SyncResponse | null = null
 // markets — logging every tick spams ~2880 lines/day per pool.
 let lastTickReason = ''
 let holdLogCounter = 0
+// Consecutive place/reposition mint failures. Reset on any successful mint;
+// when it hits MAX_CONSECUTIVE_MINT_FAILURES the bot pauses (see operationalTick).
+let consecutiveMintFailures = 0
+// Active bin seen on the previous operationalTick. Feeds the manipulation
+// guard's single-poll jump measurement. Reset to null whenever we leave the
+// OPERATIONAL loop (reconcile/pause) so a stale pre-downtime reading can't
+// register a false "jump" on the first tick back.
+let lastObservedActiveBin: number | null = null
 // Chain-agnostic adapter — replaces the previous (pool, signer, tx) triplet.
 // Reconcile picks an EvmAdapter or SolanaAdapter via `createChainAdapter`
 // based on `cfg.chainKind`. The strategy/trigger never touch chain-specific
@@ -143,6 +182,7 @@ export async function poll() {
           console.log(`[paused→resume] adopting strategy ${strategy.id} → ${sync.strategy.type}`)
           strategy = buildStrategy(sync.strategy)
         }
+        lastObservedActiveBin = null // fresh jump reference on resume
         stateManager.transition('OPERATIONAL', { reason: 'resumed' })
         break
       }
@@ -234,6 +274,9 @@ export async function reconcile(sync: SyncResponse) {
       throw new Error(`unexpected chainId ${liveChainId} (expected ${chain.chainId}) — check RPC_URL`)
     }
 
+    console.log('[reconcile] ensuring helper approvals')
+    await withTimeout(chain.ensureApprovals(), RPC_TIMEOUT_MS * 3, 'ensureApprovals')
+
     console.log('[reconcile] validating invariants')
     await withTimeout(chain.validateInvariants(), RPC_TIMEOUT_MS, 'invariants')
     console.log('[reconcile] invariants OK')
@@ -243,12 +286,26 @@ export async function reconcile(sync: SyncResponse) {
 
     console.log('[reconcile] reading active bin snapshot')
     const snap = await withTimeout(chain.snapshot(), RPC_TIMEOUT_MS, 'snapshot')
-    console.log(`[reconcile] activeBin=${snap.activeBin} — scanning ±50 bin positions`)
-    const positions = await withTimeout(
-      chain.safeBinPositions(snap.activeBin, 50),
+    console.log(`[reconcile] activeBin=${snap.activeBin} — scanning ±${RECONCILE_SCAN_WINDOW} bin positions`)
+    let positions = await withTimeout(
+      chain.safeBinPositions(snap.activeBin, RECONCILE_SCAN_WINDOW),
       RPC_TIMEOUT_MS,
       'binPositions',
     )
+    // Empty is the dangerous case on restart: if price gapped beyond the scan
+    // window while the bot was down, an existing (e.g. wall) position sits
+    // outside ±RECONCILE_SCAN_WINDOW and reads as "no position" — the bot would
+    // then mint a SECOND position and orphan the first. Before concluding there
+    // is nothing to recover, do one wide fallback sweep. Only the empty path
+    // pays this cost, so healthy restarts stay cheap.
+    if (positions.length === 0) {
+      console.log(`[reconcile] no positions in ±${RECONCILE_SCAN_WINDOW} — wide fallback sweep ±${RECONCILE_WIDE_SCAN_WINDOW}`)
+      positions = await withTimeout(
+        chain.safeBinPositions(snap.activeBin, RECONCILE_WIDE_SCAN_WINDOW),
+        RPC_TIMEOUT_MS * 3,
+        'binPositionsWide',
+      )
+    }
     console.log(`[reconcile] ${positions.length} positions found`)
     // Share-weighted center: a one-sided wall/bid-ask strategy distributes
     // shares asymmetrically, so an unweighted arithmetic mean of bin IDs lands
@@ -257,14 +314,25 @@ export async function reconcile(sync: SyncResponse) {
     // Falls back to arithmetic if every position's share is zero (defensive).
     let currentCenter: number | null = null
     if (positions.length > 0) {
-      const totalShares = positions.reduce((a, p) => a + (p.shares ?? 0n), 0n)
-      if (totalShares > 0n) {
-        // Math.round on a Number that came from a bigint division — bin IDs
-        // fit in uint24, totals do too for reasonable mint sizes.
-        const weightedNumerator = positions.reduce((a, p) => a + Number(p.shares ?? 0n) * p.id, 0)
-        currentCenter = Math.round(weightedNumerator / Number(totalShares))
+      // Prefer the strategy's own anchor recovery. For asymmetric shapes (wall,
+      // bid-ask) the drift anchor is the activeBin the position was built around,
+      // NOT the share-weighted centroid — the centroid sits offset from active
+      // and would make drift permanently exceed threshold, hot-looping rebalance.
+      // Symmetric strategies omit anchorBin() and fall through to the centroid,
+      // which equals the anchor for a symmetric layout.
+      const anchor = strategy?.anchorBin?.(positions.map((p) => p.id))
+      if (anchor != null) {
+        currentCenter = anchor
       } else {
-        currentCenter = Math.round(positions.reduce((a, p) => a + p.id, 0) / positions.length)
+        const totalShares = positions.reduce((a, p) => a + (p.shares ?? 0n), 0n)
+        if (totalShares > 0n) {
+          // Math.round on a Number that came from a bigint division — bin IDs
+          // fit in uint24, totals do too for reasonable mint sizes.
+          const weightedNumerator = positions.reduce((a, p) => a + Number(p.shares ?? 0n) * p.id, 0)
+          currentCenter = Math.round(weightedNumerator / Number(totalShares))
+        } else {
+          currentCenter = Math.round(positions.reduce((a, p) => a + p.id, 0) / positions.length)
+        }
       }
     }
     // Bot native-gas balance gate. EVM: 0.0005 ETH ≈ ~100 rebalances at
@@ -297,6 +365,7 @@ export async function reconcile(sync: SyncResponse) {
     }
     stateManager.update({ currentCenter })
 
+    lastObservedActiveBin = null // fresh jump reference after reconcile
     stateManager.transition('OPERATIONAL', { reason: 'reconciled' })
     console.log(`[reconcile] done in ${Date.now() - startMs}ms`)
     console.log('[reconcile] → OPERATIONAL')
@@ -384,6 +453,13 @@ async function operationalTick(sync: SyncResponse) {
       : p.reserveY > 0n   // X-side bin filled = Y appeared
   })
 
+  // Per-pair jump limit: operator knob override, else derived from binStep so a
+  // 20% single-poll move maps to the right bin count for this market.
+  const jumpKnob = sync.strategy?.knobs.manipulationJumpBins
+  const manipulationJumpBins = typeof jumpKnob === 'number' && jumpKnob > 0
+    ? jumpKnob
+    : binStepToJumpBins(snap.binStep)
+
   const action = decide({
     activeBin: snap.activeBin,
     currentCenter: stateManager.snapshot.currentCenter,
@@ -393,7 +469,14 @@ async function operationalTick(sync: SyncResponse) {
     anyBinFilled,
     rebalanceCooldownSeconds: sync.rebalanceCooldownSeconds,
     rebalanceBinsThreshold: sync.strategy?.knobs.rebalanceBinsThreshold ?? 2,
+    lastObservedActiveBin,
+    manipulationJumpBins,
   })
+
+  // Advance the jump reference AFTER deciding, every tick (even on hold), so a
+  // sustained move confirms on the next poll (jump shrinks once price settles)
+  // while a one-tick spike is measured against the pre-spike level exactly once.
+  lastObservedActiveBin = snap.activeBin
 
   // Throttle hold-reason logging: hysteresis can hold for hours during
   // ranging markets; logging every 30s tick = 2880 lines/day per pool.
@@ -420,10 +503,19 @@ async function operationalTick(sync: SyncResponse) {
         payload: { txHash: receipt.hash, binIds: ids, shareTotal: shares.reduce((a, b) => a + b, 0n).toString() },
       })
     } else {
+      // Reposition / place: burn existing LP, then re-mint around the fresh
+      // active bin. These are two separate Safe txs; between them the Safe holds
+      // idle inventory with no LP. If the mint fails — e.g. a searcher front-runs
+      // the active bin so the plan's bins are mis-sided and LB rejects the
+      // composition — the burned position is already gone, so clear currentCenter
+      // right after the burn. The next tick then re-places from a fresh snapshot
+      // instead of reasoning about a stale center, and the failure counter below
+      // bounds how long a griefer can pin the capital idle.
       if (positions.length > 0) {
         const ids = positions.map((p) => p.id)
         const shares = positions.map((p) => p.shares)
         await chain.burn(ids, shares)
+        stateManager.update({ currentCenter: null })
       }
       const updatedSnap = await chain.snapshot()
       const plan = strategy.plan({
@@ -433,7 +525,20 @@ async function operationalTick(sync: SyncResponse) {
         binStep: updatedSnap.binStep,
       })
       const receipt = await chain.mint(plan)
-      const newCenter = Math.round(plan.binIds.reduce((a, b) => a + b, 0) / plan.binIds.length)
+      // A mined-but-reverted mint returns status 'reverted' (not a throw). Treat
+      // it the same as a thrown failure so the grief counter and idle-capital
+      // handling in catch{} apply.
+      if (receipt.status === 'reverted') {
+        throw new Error(`mint reverted (tx=${receipt.hash}) — active bin likely moved between plan and inclusion`)
+      }
+      consecutiveMintFailures = 0
+      // Anchor drift tracking to the activeBin the plan was built around — NOT
+      // the bin centroid. For asymmetric shapes (wall, one-sided bid-ask) the
+      // centroid is deliberately offset from active, so anchoring to it made
+      // drift = |active - centroid| permanently exceed threshold, hot-looping
+      // burn+remint every cooldown. Anchoring to active means we only rebalance
+      // when price actually moves away from where we built the position.
+      const newCenter = updatedSnap.activeBin
       stateManager.update({
         currentCenter: newCenter,
         lastRebalanceCenter: newCenter,
@@ -452,6 +557,28 @@ async function operationalTick(sync: SyncResponse) {
       type: 'error',
       payload: { action: action.action, error: String(e) },
     })
+    // Bound the idle-capital grief loop. A place/reposition burns first, so a
+    // repeatedly-failing mint (front-run or sharp volatility) leaves inventory
+    // idle in the Safe. After N consecutive failures, pause for the operator
+    // rather than retrying every tick forever. withdraw_filled is exempt — it's
+    // a pure burn with no re-mint, so a failure there doesn't strand LP.
+    if (action.action !== 'withdraw_filled') {
+      consecutiveMintFailures += 1
+      if (consecutiveMintFailures >= MAX_CONSECUTIVE_MINT_FAILURES) {
+        console.error(`[op] ${consecutiveMintFailures} consecutive mint failures — pausing for operator`)
+        stateManager.transition('PAUSED', {
+          reason: `recoverable:mint failed ${consecutiveMintFailures}× — active-bin front-run or volatility; inventory idle in Safe`,
+        })
+        try {
+          await cp.emitEvent({
+            ts: Math.floor(Date.now() / 1000),
+            type: 'error',
+            payload: { reason: 'mint_repeated_failure', count: consecutiveMintFailures },
+          })
+        } catch { /* best effort */ }
+        consecutiveMintFailures = 0
+      }
+    }
   }
 }
 

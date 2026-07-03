@@ -92,6 +92,9 @@ export interface ChainAdapter {
   /** Native-gas-token balance of the bot signer (wei on EVM, lamports on Solana). */
   getBotBalance(): Promise<bigint>
 
+  /** Submit any missing Safe→helper approvals (tokenX, tokenY, pair ERC-1155). No-op if already set. */
+  ensureApprovals(): Promise<void>
+
   /** Pre-flight checks that abort reconcile early on misconfig. */
   validateInvariants(): Promise<void>
 

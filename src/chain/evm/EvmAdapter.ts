@@ -8,9 +8,12 @@ import type {
   MintPlan,
   TxReceipt,
 } from '../types'
-import { HELPER_ABI } from '../../abi'
+import { HELPER_ABI, ERC20_ABI, LB_PAIR_ABI } from '../../abi'
 import { Pool } from '../../pool'
 import { SafeSigner } from '../../safeSigner'
+
+const erc20Iface = new ethers.Interface(ERC20_ABI)
+const pairIface = new ethers.Interface(LB_PAIR_ABI)
 
 const helperIface = new ethers.Interface(HELPER_ABI)
 
@@ -71,6 +74,53 @@ export class EvmAdapter implements ChainAdapter {
     return this.pool.validateInvariants()
   }
 
+  async ensureApprovals(): Promise<void> {
+    const helper = this.addrs.helper
+    const custody = this.addrs.custody
+
+    const [allowX, allowY, lbApproved] = await Promise.all([
+      this.pool.tokenX.allowance(custody, helper).then(BigInt),
+      this.pool.tokenY.allowance(custody, helper).then(BigInt),
+      this.pool.pair.isApprovedForAll(custody, helper),
+    ])
+
+    if (allowX > 0n && allowY > 0n && lbApproved) return
+    console.log(`[ensureApprovals] missing: allowX=${allowX} allowY=${allowY} lbApproved=${lbApproved}`)
+
+    const base = {
+      value: 0n, operation: 0 as const,
+      safeTxGas: 0n, baseGas: 0n, gasPrice: 0n,
+      gasToken: ethers.ZeroAddress, refundReceiver: ethers.ZeroAddress,
+    }
+
+    if (allowX === 0n) {
+      console.log('[ensureApprovals] tokenX.approve(helper, max)')
+      await this.signer.execTransaction({
+        to: this.addrs.tokenX,
+        data: erc20Iface.encodeFunctionData('approve', [helper, ethers.MaxUint256]),
+        ...base,
+      })
+    }
+
+    if (allowY === 0n) {
+      console.log('[ensureApprovals] tokenY.approve(helper, max)')
+      await this.signer.execTransaction({
+        to: this.addrs.tokenY,
+        data: erc20Iface.encodeFunctionData('approve', [helper, ethers.MaxUint256]),
+        ...base,
+      })
+    }
+
+    if (!lbApproved) {
+      console.log('[ensureApprovals] pair.setApprovalForAll(helper, true)')
+      await this.signer.execTransaction({
+        to: this.addrs.pair,
+        data: pairIface.encodeFunctionData('setApprovalForAll', [helper, true]),
+        ...base,
+      })
+    }
+  }
+
   async getChainId(): Promise<number> {
     const network = await this.pool.provider.getNetwork()
     return Number(network.chainId)
@@ -80,6 +130,9 @@ export class EvmAdapter implements ChainAdapter {
 
   async mint(plan: MintPlan): Promise<TxReceipt> {
     const data = helperIface.encodeFunctionData('mintAtomic', [
+      this.addrs.pair,
+      this.addrs.tokenX,
+      this.addrs.tokenY,
       plan.binIds,
       plan.distributionX,
       plan.distributionY,
@@ -105,7 +158,7 @@ export class EvmAdapter implements ChainAdapter {
   }
 
   async burn(binIds: number[], shares: bigint[]): Promise<TxReceipt> {
-    const data = helperIface.encodeFunctionData('burnAtomic', [binIds, shares])
+    const data = helperIface.encodeFunctionData('burnAtomic', [this.addrs.pair, binIds, shares])
     const receipt = await this.signer.execTransaction({
       to: this.addrs.helper,
       value: 0n,

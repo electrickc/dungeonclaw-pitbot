@@ -51,4 +51,17 @@ export class WallStrategy implements Strategy {
       amountY: yAvailable,
     }
   }
+
+  /**
+   * The wall is built as `binIds[i] = activeBin - offsetFromActive - i`, so the
+   * highest (first) bin is exactly `offsetFromActive` below the anchor. Recover
+   * the anchor by adding the offset back to the highest held bin. This keeps
+   * drift measured against where active was at mint time, not the wall centroid
+   * (which sits ~offset + binCount/2 below active and would hot-loop rebalance).
+   */
+  anchorBin(binIds: number[]): number {
+    if (binIds.length === 0) return 0
+    const highest = Math.max(...binIds)
+    return highest + this.cfg.offsetFromActive
+  }
 }

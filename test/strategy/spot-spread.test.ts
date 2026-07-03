@@ -131,6 +131,26 @@ describe('SpotSpreadStrategy.plan', () => {
     expect(planXDust.amountX).toBe(0n)
     expect(planXDust.amountY).toBe(1_000_000_000_000_000_000n)
   })
+
+  // Regression guard: amountY must never be > 0 when sumDistributionY == 0.
+  // A non-zero amountY with all-zero distributionY causes the Helper to send WETH
+  // to the pair with no bin owner — orphaned balance claimable by MEV bots.
+  it('invariant: amountY > 0 iff sumDistributionY > 0 (no orphaned WETH)', () => {
+    const strat = new SpotSpreadStrategy({ binCount: 20, binsAbove: 10, binsBelow: 10 })
+    const plans = [
+      strat.plan({ activeBin: 8388608, xAvailable: 1_000_000_000_000_000_000n, yAvailable: 1_000_000_000_000_000_000n, binStep: 10 }),
+      strat.plan({ activeBin: 8388608, xAvailable: 1n, yAvailable: 1_000_000_000_000_000_000n, binStep: 10 }),
+      strat.plan({ activeBin: 8388608, xAvailable: 1_000_000_000_000_000_000n, yAvailable: 1n, binStep: 10 }),
+    ]
+    for (const plan of plans) {
+      const sumX = plan.distributionX.reduce((a, b) => a + b, 0n)
+      const sumY = plan.distributionY.reduce((a, b) => a + b, 0n)
+      if (plan.amountX > 0n) expect(sumX).toBeGreaterThan(0n)
+      if (plan.amountY > 0n) expect(sumY).toBeGreaterThan(0n)
+      if (sumX === 0n) expect(plan.amountX).toBe(0n)
+      if (sumY === 0n) expect(plan.amountY).toBe(0n)
+    }
+  })
 })
 
 describe('buildStrategy', () => {

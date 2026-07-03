@@ -14,17 +14,14 @@ export const LB_PAIR_ABI = [
   'function tokenY() view returns (address)',
   'function feeParameters() view returns (uint16, uint16, uint16, uint16, uint16, uint24, uint16, uint24, uint24, uint24, uint24, uint40)',
   'function isApprovedForAll(address account, address operator) view returns (bool)',
+  'function setApprovalForAll(address operator, bool approved)',
 ] as const
 
-// JanusHelper (atomic mint+burn wrapper)
+// JanusHelper — stateless, deployed once for the whole protocol
 export const HELPER_ABI = [
-  'function mintAtomic(uint256[] ids, uint256[] distributionX, uint256[] distributionY, uint256 amountX, uint256 amountY) returns (uint256 amountXAdded, uint256 amountYAdded)',
-  'function burnAtomic(uint256[] ids, uint256[] shares) returns (uint256 amountX, uint256 amountY)',
-  'function sweep(address token)',
-  'function OWNER() view returns (address)',
-  'function PAIR() view returns (address)',
-  'function WETH() view returns (address)',
-  'function DCLAW() view returns (address)',
+  'function mintAtomic(address pair, address tokenX, address tokenY, uint256[] ids, uint256[] distributionX, uint256[] distributionY, uint256 amountX, uint256 amountY) returns (uint256 amountXAdded, uint256 amountYAdded)',
+  'function burnAtomic(address pair, uint256[] ids, uint256[] shares) returns (uint256 amountX, uint256 amountY)',
+  'function sweep(address token, address to)',
 ] as const
 
 // Gnosis Safe v1.3+ (subset)

@@ -85,20 +85,13 @@ export class Pool {
 
   /** Assert invariants used at RECONCILE state. */
   async validateInvariants(): Promise<void> {
-    const helperOwner = await this.helper.OWNER()
-    if (helperOwner.toLowerCase() !== this.addrs.safe.toLowerCase()) {
-      throw new Error(`helper owner is ${helperOwner}, expected Safe ${this.addrs.safe}`)
-    }
     const isBotOwner = await this.safe.isOwner(this.wallet.address)
     if (!isBotOwner) {
       throw new Error(`bot wallet ${this.wallet.address} is not a Safe owner`)
     }
-    // Catch the GS013 footgun: PitBotHelper.mintAtomic does
-    //   tokenX.transferFrom(Safe, Pair, amountX)
-    //   tokenY.transferFrom(Safe, Pair, amountY)
-    // before pair.mint(). If either allowance is 0 the call reverts inside
-    // the helper and the Safe surfaces it as GS013 — opaque, easy to
-    // misread as a bin-math issue. Fail loud at reconcile instead.
+    // Catch the GS013 footgun: mintAtomic calls transferFrom(Safe, pair, amount)
+    // for each token. Zero allowance → revert inside the helper → Safe surfaces
+    // it as opaque GS013. Fail loud at reconcile instead.
     const [allowX, allowY, lbApproved] = await Promise.all([
       this.tokenX.allowance(this.addrs.safe, this.addrs.helper).then(BigInt),
       this.tokenY.allowance(this.addrs.safe, this.addrs.helper).then(BigInt),

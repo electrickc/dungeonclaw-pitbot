@@ -120,8 +120,8 @@ export class BidAskStrategy implements Strategy {
       binIds,
       distributionX,
       distributionY,
-      amountX: xAvailable,
-      amountY: yAvailable,
+      amountX: sumX > 0n ? xAvailable : 0n,
+      amountY: sumY > 0n ? yAvailable : 0n,
     }
   }
 }
