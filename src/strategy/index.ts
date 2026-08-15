@@ -23,7 +23,7 @@ export interface PlanInput {
 
 /** Bots use the Strategy interface to decide what to mint. Pure functions. */
 export interface Strategy {
-  readonly id: 'spot-spread' | 'spot-wide' | 'wall' | 'spot-concentrated' | 'curve' | 'bid-ask'
+  readonly id: 'spot-spread' | 'spot-wide' | 'wall' | 'spot-concentrated' | 'curve' | 'bid-ask' | 'adaptive'
 
   plan(input: PlanInput): MintPlan
 

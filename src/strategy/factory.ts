@@ -4,12 +4,19 @@ import { WallStrategy } from './wall'
 import { BidAskStrategy } from './bid-ask'
 import { CurveStrategy } from './curve'
 import { SpotConcentratedStrategy } from './spot-concentrated'
+import { AdaptiveStrategy } from './adaptive'
 
 export function buildStrategy(spec: {
-  type: 'spot-spread' | 'spot-wide' | 'wall' | 'spot-concentrated' | 'curve' | 'bid-ask'
+  type: 'spot-spread' | 'spot-wide' | 'wall' | 'spot-concentrated' | 'curve' | 'bid-ask' | 'adaptive'
   knobs: Record<string, any>
 }) {
   switch (spec.type) {
+    case 'adaptive':
+      return new AdaptiveStrategy({
+        binsAbove: spec.knobs.binsAbove ?? 5,
+        binsBelow: spec.knobs.binsBelow ?? 5,
+        coldStartBins: spec.knobs.coldStartBins ?? 3,
+      })
     case 'spot-spread':
       return new SpotSpreadStrategy({
         binCount: spec.knobs.binCount ?? 20,
