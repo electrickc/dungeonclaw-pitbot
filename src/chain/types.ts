@@ -116,6 +116,9 @@ export interface ChainAdapterConfig {
   rpcUrl: string
   botPrivateKey: string
   addrs: PoolAddresses
+  // Expected chainId for EVM adapters, asserted against the live RPC. Optional
+  // so non-EVM adapters and older callers can omit it (EVM defaults to Base).
+  expectedChainId?: number
 }
 
 /**

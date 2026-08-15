@@ -17,9 +17,10 @@ import { EvmAdapter } from './evm/EvmAdapter'
 export async function createChainAdapter(cfg: ChainAdapterConfig): Promise<ChainAdapter> {
   switch (cfg.kind) {
     case 'evm':
-      // Base mainnet. Hard-coded for now — multi-EVM-chain support is a
-      // separate config knob if/when needed.
-      return new EvmAdapter(cfg, 8453)
+      // Expected chainId comes from CHAIN_ID env via cfg.expectedChainId
+      // (default 8453/Base for back-compat). Asserted against the live RPC
+      // during reconcile so a misconfigured RPC_URL fails loudly.
+      return new EvmAdapter(cfg, cfg.expectedChainId ?? 8453)
     case 'solana': {
       const { SolanaAdapter } = await import('./solana/SolanaAdapter')
       return new SolanaAdapter(cfg)

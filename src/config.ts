@@ -28,12 +28,27 @@ export interface BotConfig {
   // Which chain this bot is configured for. Defaults to 'evm' so existing
   // Base bots running v0.1.19 keep working without a compose YAML update.
   chainKind: ChainKind
+  // Expected EVM chainId, asserted against the live RPC at reconcile. Comes
+  // from the CHAIN_ID env (set by the control plane's provision compose).
+  // Defaults to 8453 (Base) so pre-multichain bots keep working unchanged.
+  expectedChainId: number
 }
 
 export function loadConfig(): BotConfig {
   const rawChain = (process.env.CHAIN_KIND ?? 'evm').toLowerCase()
   if (rawChain !== 'evm' && rawChain !== 'solana') {
     throw new Error(`CHAIN_KIND must be 'evm' or 'solana', got '${rawChain}'`)
+  }
+  // CHAIN_ID is optional for back-compat (pre-multichain compose YAMLs omit it);
+  // default to Base. When present it must be a positive integer.
+  const rawChainId = process.env.CHAIN_ID
+  let expectedChainId = 8453
+  if (rawChainId != null && rawChainId.trim() !== '') {
+    const parsed = Number(rawChainId)
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      throw new Error(`CHAIN_ID must be a positive integer, got '${rawChainId}'`)
+    }
+    expectedChainId = parsed
   }
   return {
     poolId: req('POOL_ID'),
@@ -42,5 +57,6 @@ export function loadConfig(): BotConfig {
     rpcUrl: req('RPC_URL'),
     statePath: process.env.STATE_PATH ?? '/data/state.json',
     chainKind: rawChain,
+    expectedChainId,
   }
 }

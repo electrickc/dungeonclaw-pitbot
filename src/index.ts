@@ -256,6 +256,7 @@ export async function reconcile(sync: SyncResponse) {
       kind: cfg.chainKind,
       rpcUrl: cfg.rpcUrl,
       botPrivateKey: wallet.privateKey,
+      expectedChainId: cfg.expectedChainId,
       addrs: {
         pair: sync.pairAddress,
         helper: sync.helperAddress,
