@@ -4,6 +4,10 @@ export const LB_PAIR_ABI = [
   'function burn(uint256[] ids, uint256[] amounts, address to) returns (uint256 amountX, uint256 amountY)',
   'function safeBatchTransferFrom(address from, address to, uint256[] ids, uint256[] amounts)',
   'function balanceOf(address account, uint256 id) view returns (uint256)',
+  // Batched share read — collapses a per-bin balanceOf loop into ONE call.
+  // Without this, scanning a ~50-bin spot-wide window was 50-100 sequential
+  // eth_calls and timed out on slower RPCs ("RPC timeout on binPositions").
+  'function balanceOfBatch(address[] accounts, uint256[] ids) view returns (uint256[])',
   'function totalSupply(uint256 id) view returns (uint256)',
   'function getReservesAndId() view returns (uint256, uint256, uint256)',
   // Per-bin reserves — used by safeBinPositions() in v0.1.6+ for fill detection.
@@ -39,4 +43,11 @@ export const ERC20_ABI = [
   'function transfer(address, uint256) returns (bool)',
   'function approve(address, uint256) returns (bool)',
   'function allowance(address, address) view returns (uint256)',
+] as const
+
+// Multicall3 — canonical CREATE2 address, deployed on Base AND Robinhood.
+// Used to batch per-bin getBin() reads into a single eth_call.
+export const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11'
+export const MULTICALL3_ABI = [
+  'function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[] returnData)',
 ] as const

@@ -1,5 +1,5 @@
 import { ethers } from 'ethers'
-import { LB_PAIR_ABI, HELPER_ABI, SAFE_ABI, ERC20_ABI } from './abi'
+import { LB_PAIR_ABI, HELPER_ABI, SAFE_ABI, ERC20_ABI, MULTICALL3_ABI, MULTICALL3_ADDRESS } from './abi'
 
 export interface PoolAddresses {
   pair: string
@@ -31,6 +31,7 @@ export class Pool {
   readonly safe: ethers.Contract
   readonly tokenX: ethers.Contract
   readonly tokenY: ethers.Contract
+  readonly multicall: ethers.Contract
   private cachedBinStep: number | null = null
 
   constructor(rpcUrl: string, botPrivateKey: string, readonly addrs: PoolAddresses) {
@@ -41,6 +42,7 @@ export class Pool {
     this.safe = new ethers.Contract(addrs.safe, SAFE_ABI, this.wallet)
     this.tokenX = new ethers.Contract(addrs.tokenX, ERC20_ABI, this.wallet)
     this.tokenY = new ethers.Contract(addrs.tokenY, ERC20_ABI, this.wallet)
+    this.multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, this.provider)
   }
 
   async getActiveBin(): Promise<number> {
@@ -72,13 +74,35 @@ export class Pool {
   async safeBinPositions(activeBin: number, windowSize: number): Promise<BinPosition[]> {
     const start = activeBin - windowSize
     const end = activeBin + windowSize
+    const ids: number[] = []
+    for (let id = start; id <= end; id++) ids.push(id)
+    if (ids.length === 0) return []
+
+    // 1. ONE batched read of the Safe's shares across the whole window. This
+    //    replaces the old per-bin balanceOf loop (50-100 sequential eth_calls)
+    //    that timed out on slower RPCs.
+    const accounts = ids.map(() => this.addrs.safe)
+    const sharesRaw: bigint[] = (await this.pair.balanceOfBatch(accounts, ids)).map((s: bigint) => BigInt(s))
+
+    const held = ids
+      .map((id, i) => ({ id, shares: sharesRaw[i] ?? 0n }))
+      .filter((h) => h.shares > 0n)
+    if (held.length === 0) return []
+
+    // 2. ONE multicall for the per-bin reserves of only the held bins.
+    const iface = this.pair.interface
+    const calls = held.map((h) => ({
+      target: this.addrs.pair,
+      allowFailure: false,
+      callData: iface.encodeFunctionData('getBin', [h.id]),
+    }))
+    const results: Array<{ success: boolean; returnData: string }> =
+      await this.multicall.aggregate3.staticCall(calls)
+
     const positions: BinPosition[] = []
-    for (let id = start; id <= end; id++) {
-      const shares = BigInt(await this.pair.balanceOf(this.addrs.safe, id))
-      if (shares > 0n) {
-        const [reserveX, reserveY] = await this.pair.getBin(id)
-        positions.push({ id, shares, reserveX: BigInt(reserveX), reserveY: BigInt(reserveY) })
-      }
+    for (let i = 0; i < held.length; i++) {
+      const [reserveX, reserveY] = iface.decodeFunctionResult('getBin', results[i].returnData)
+      positions.push({ id: held[i].id, shares: held[i].shares, reserveX: BigInt(reserveX), reserveY: BigInt(reserveY) })
     }
     return positions
   }
