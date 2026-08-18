@@ -22,7 +22,7 @@ export interface SyncResponse {
 
 export interface Event {
   ts: number
-  type: 'rebalance' | 'place' | 'withdraw' | 'error' | 'state_transition'
+  type: 'rebalance' | 'place' | 'withdraw' | 'error' | 'state_transition' | 'gas_returned'
   payload: Record<string, any>
 }
 

@@ -95,6 +95,36 @@ function ensureBotWallet(): ethers.Wallet {
   return botWallet
 }
 
+// Sweep the bot signer's leftover native gas to the Safe (on retire). Leaves a
+// small reserve to pay for this very transfer. EVM chains only — the bot signer
+// holds native ETH for gas on both Base and Robinhood.
+async function returnGasToSafe(safeAddress: string): Promise<void> {
+  if (cfg.chainKind !== 'evm') return
+  try {
+    const provider = new ethers.JsonRpcProvider(cfg.rpcUrl)
+    const wallet = ensureBotWallet().connect(provider)
+    const bal = await provider.getBalance(wallet.address)
+    const fee = await provider.getFeeData()
+    const gasPrice = fee.maxFeePerGas ?? fee.gasPrice ?? 1_000_000_000n
+    // Reserve 21000 (plain transfer) × price × 3 as a safety buffer.
+    const reserve = 21_000n * gasPrice * 3n
+    if (bal <= reserve) {
+      console.log(`[retire] gas ${bal} wei <= reserve ${reserve} — nothing to return`)
+      return
+    }
+    const value = bal - reserve
+    console.log(`[retire] returning ${value} wei gas to Safe ${safeAddress}`)
+    const tx = await wallet.sendTransaction({ to: safeAddress, value })
+    const receipt = await tx.wait()
+    console.log(`[retire] gas returned: ${tx.hash} status=${receipt?.status}`)
+    try {
+      await cp.emitEvent({ ts: Math.floor(Date.now() / 1000), type: 'gas_returned', payload: { hash: tx.hash, to: safeAddress, value: value.toString() } })
+    } catch { /* best-effort event */ }
+  } catch (e) {
+    console.error(`[retire] gas return failed: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
 async function boot() {
   console.log(`[boot] pool=${cfg.poolId} state=${stateManager.current}`)
   const wallet = ensureBotWallet()
@@ -133,6 +163,10 @@ export async function poll() {
   }
 
   if (sync.status === 'retired') {
+    // Final act: return leftover gas ETH to the Safe. The bot signer's key is
+    // enclave-only, so this is the ONLY way its residual gas can be recovered —
+    // once this enclave dies the key (and any un-swept ETH) is gone forever.
+    if (sync.safeAddress) await returnGasToSafe(sync.safeAddress)
     stateManager.transition('RETIRED', { reason: 'retired by control plane' })
     process.exit(0)
   }
