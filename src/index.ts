@@ -9,6 +9,7 @@ import type { ChainAdapter } from './chain/types'
 import { buildStrategy, Strategy } from './strategy'
 import { decide } from './trigger'
 import { withTimeout } from './util/withTimeout'
+import { ERC20_ABI } from './abi'
 
 const RPC_TIMEOUT_MS = 20_000
 const RECONCILE_TIMEOUT_SECONDS = 90
@@ -125,6 +126,57 @@ async function returnGasToSafe(safeAddress: string): Promise<void> {
   }
 }
 
+/**
+ * Sweep ERC-20 tokens (and leftover native gas) that were mistakenly sent to
+ * the bot's own EOA out to the pool's Safe. ERC-20 transfers happen FIRST
+ * (they need gas); the native sweep is last (via returnGasToSafe).
+ *
+ * Idempotent: tokens with a zero balance are silently skipped, so re-running
+ * after a partial sweep is safe.
+ */
+async function recoverTokensToSafe(
+  safeAddress: string,
+  tokenAddrs: string[],
+): Promise<{ token: string; symbol?: string; amount: string }[]> {
+  if (cfg.chainKind !== 'evm') {
+    console.log('[recover] non-EVM chain — skipping token recovery')
+    return []
+  }
+  const provider = new ethers.JsonRpcProvider(cfg.rpcUrl)
+  const wallet = ensureBotWallet().connect(provider)
+  const botAddress = wallet.address
+
+  // Deduplicate and remove falsy values.
+  const unique = [...new Set(tokenAddrs.filter(Boolean))]
+  const swept: { token: string; symbol?: string; amount: string }[] = []
+
+  for (const tokenAddr of unique) {
+    try {
+      const erc20 = new ethers.Contract(tokenAddr, ERC20_ABI, wallet)
+      const balance: bigint = await erc20.balanceOf(botAddress)
+      if (balance === 0n) {
+        console.log(`[recover] ${tokenAddr}: balance=0 — skip`)
+        continue
+      }
+      let symbol: string | undefined
+      try { symbol = await erc20.symbol() } catch { /* optional */ }
+      console.log(`[recover] ${tokenAddr} (${symbol ?? '?'}): transferring ${balance} to Safe ${safeAddress}`)
+      const tx = await erc20.transfer(safeAddress, balance)
+      await tx.wait()
+      console.log(`[recover] ${tokenAddr}: transfer confirmed tx=${tx.hash}`)
+      swept.push({ token: tokenAddr, symbol, amount: balance.toString() })
+    } catch (e) {
+      console.error(`[recover] ${tokenAddr}: failed — ${e instanceof Error ? e.message : String(e)}`)
+      // Continue with remaining tokens.
+    }
+  }
+
+  // Native sweep LAST (tokens need gas; once gas is swept this EOA is dry).
+  await returnGasToSafe(safeAddress)
+
+  return swept
+}
+
 async function boot() {
   console.log(`[boot] pool=${cfg.poolId} state=${stateManager.current}`)
   const wallet = ensureBotWallet()
@@ -169,6 +221,24 @@ export async function poll() {
     if (sync.safeAddress) await returnGasToSafe(sync.safeAddress)
     stateManager.transition('RETIRED', { reason: 'retired by control plane' })
     process.exit(0)
+  }
+
+  // Token-recovery sweep: runs even while paused so a mis-sent token can always
+  // be recovered without resuming bot operations. The control plane clears
+  // recoverToSafe when it sees the 'tokens_recovered' event.
+  if (sync.recoverToSafe && sync.safeAddress) {
+    const tokenAddrs = [sync.tokenXAddress, sync.tokenYAddress].filter(Boolean) as string[]
+    const swept = await recoverTokensToSafe(sync.safeAddress, tokenAddrs)
+    try {
+      await cp.emitEvent({
+        ts: Math.floor(Date.now() / 1000),
+        type: 'tokens_recovered',
+        payload: { safeAddress: sync.safeAddress, swept },
+      })
+    } catch (e) {
+      console.error(`[recover] event emit failed: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    return
   }
 
   if (sync.killSwitch && stateManager.current === 'OPERATIONAL') {

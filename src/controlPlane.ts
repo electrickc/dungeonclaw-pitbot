@@ -18,11 +18,17 @@ export interface SyncResponse {
   chainPollIntervalSeconds: number
   killSwitch: boolean
   consecutiveSyncFailureThreshold: number
+  /** When true, bot sweeps tokenX/tokenY (and leftover native gas) from its own EOA to the Safe. */
+  recoverToSafe?: boolean
+  /** ERC-20 address of tokenX to recover (omit or null = skip). */
+  tokenXAddress?: string | null
+  /** ERC-20 address of tokenY to recover (omit or null = skip). */
+  tokenYAddress?: string | null
 }
 
 export interface Event {
   ts: number
-  type: 'rebalance' | 'place' | 'withdraw' | 'error' | 'state_transition' | 'gas_returned'
+  type: 'rebalance' | 'place' | 'withdraw' | 'error' | 'state_transition' | 'gas_returned' | 'tokens_recovered'
   payload: Record<string, any>
 }
 

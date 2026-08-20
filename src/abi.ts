@@ -43,6 +43,8 @@ export const ERC20_ABI = [
   'function transfer(address, uint256) returns (bool)',
   'function approve(address, uint256) returns (bool)',
   'function allowance(address, address) view returns (uint256)',
+  'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
 ] as const
 
 // Multicall3 — canonical CREATE2 address, deployed on Base AND Robinhood.
