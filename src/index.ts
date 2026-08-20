@@ -137,10 +137,16 @@ async function returnGasToSafe(safeAddress: string): Promise<void> {
 async function recoverTokensToSafe(
   safeAddress: string,
   tokenAddrs: string[],
-): Promise<{ token: string; symbol?: string; amount: string }[]> {
+): Promise<{
+  swept: { token: string; symbol?: string; amount: string }[]
+  errors: { token: string; error: string }[]
+}> {
+  const swept: { token: string; symbol?: string; amount: string }[] = []
+  const errors: { token: string; error: string }[] = []
+
   if (cfg.chainKind !== 'evm') {
     console.log('[recover] non-EVM chain — skipping token recovery')
-    return []
+    return { swept, errors }
   }
   const provider = new ethers.JsonRpcProvider(cfg.rpcUrl)
   const wallet = ensureBotWallet().connect(provider)
@@ -148,7 +154,6 @@ async function recoverTokensToSafe(
 
   // Deduplicate and remove falsy values.
   const unique = [...new Set(tokenAddrs.filter(Boolean))]
-  const swept: { token: string; symbol?: string; amount: string }[] = []
 
   for (const tokenAddr of unique) {
     try {
@@ -166,15 +171,26 @@ async function recoverTokensToSafe(
       console.log(`[recover] ${tokenAddr}: transfer confirmed tx=${tx.hash}`)
       swept.push({ token: tokenAddr, symbol, amount: balance.toString() })
     } catch (e) {
-      console.error(`[recover] ${tokenAddr}: failed — ${e instanceof Error ? e.message : String(e)}`)
+      const error = e instanceof Error ? e.message : String(e)
+      console.error(`[recover] ${tokenAddr}: failed — ${error}`)
+      errors.push({ token: tokenAddr, error })
       // Continue with remaining tokens.
     }
   }
 
   // Native sweep LAST (tokens need gas; once gas is swept this EOA is dry).
-  await returnGasToSafe(safeAddress)
+  // Guarded so a native-sweep failure surfaces in `errors` (preserving the
+  // control plane's retry signal) instead of aborting. returnGasToSafe already
+  // swallows its own errors, so this catch is defense-in-depth.
+  try {
+    await returnGasToSafe(safeAddress)
+  } catch (e) {
+    const error = e instanceof Error ? e.message : String(e)
+    console.error(`[recover] native sweep failed — ${error}`)
+    errors.push({ token: 'native', error })
+  }
 
-  return swept
+  return { swept, errors }
 }
 
 async function boot() {
@@ -228,12 +244,16 @@ export async function poll() {
   // recoverToSafe when it sees the 'tokens_recovered' event.
   if (sync.recoverToSafe && sync.safeAddress) {
     const tokenAddrs = [sync.tokenXAddress, sync.tokenYAddress].filter(Boolean) as string[]
-    const swept = await recoverTokensToSafe(sync.safeAddress, tokenAddrs)
+    const { swept, errors } = await recoverTokensToSafe(sync.safeAddress, tokenAddrs)
     try {
+      // Emit unconditionally; the control plane clears recoverToSafe ONLY when
+      // `errors` is empty. Idempotent success (all balances already 0) yields
+      // swept:[] errors:[] → flag cleared. Any failure keeps errors non-empty
+      // → flag stays set → retried next poll.
       await cp.emitEvent({
         ts: Math.floor(Date.now() / 1000),
         type: 'tokens_recovered',
-        payload: { safeAddress: sync.safeAddress, swept },
+        payload: { safeAddress: sync.safeAddress, swept, errors },
       })
     } catch (e) {
       console.error(`[recover] event emit failed: ${e instanceof Error ? e.message : String(e)}`)
