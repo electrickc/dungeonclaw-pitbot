@@ -585,6 +585,14 @@ async function operationalTick(sync: SyncResponse) {
     ? jumpKnob
     : binStepToJumpBins(snap.binStep)
 
+  // Deployed range edges from the bot's actual held bins (safeBinPositions
+  // returns only bins with shares > 0). These drive the edge-based rebalance
+  // trigger: reposition only once the active bin exits [heldMinBin, heldMaxBin]
+  // — i.e. one bin past the last edge — rather than on a small drift from center.
+  const heldIds = positions.map((p) => p.id)
+  const heldMinBin = heldIds.length ? Math.min(...heldIds) : null
+  const heldMaxBin = heldIds.length ? Math.max(...heldIds) : null
+
   const action = decide({
     activeBin: snap.activeBin,
     currentCenter: stateManager.snapshot.currentCenter,
@@ -596,6 +604,8 @@ async function operationalTick(sync: SyncResponse) {
     rebalanceBinsThreshold: sync.strategy?.knobs.rebalanceBinsThreshold ?? 2,
     lastObservedActiveBin,
     manipulationJumpBins,
+    heldMinBin,
+    heldMaxBin,
   })
 
   // Advance the jump reference AFTER deciding, every tick (even on hold), so a

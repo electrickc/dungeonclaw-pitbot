@@ -141,3 +141,42 @@ describe('trigger.decide', () => {
     })
   })
 })
+
+describe('trigger.decide — edge-based rebalance (deployed range)', () => {
+  const base = {
+    currentCenter: 100,
+    lastRebalanceTs: 1,
+    nowTs: 100000,             // far past cooldown by default
+    anyBinFilled: false,
+    rebalanceCooldownSeconds: 60,
+    rebalanceBinsThreshold: 2, // small legacy threshold — MUST be ignored when a range is present
+    heldMinBin: 90,
+    heldMaxBin: 110,
+  }
+
+  it('HOLDS while spot is inside the deployed range, even well past the legacy % threshold', () => {
+    // drift 8 ≫ legacy threshold 2, but still inside [90,110] → no rebalance
+    expect(decide({ ...base, activeBin: 108 }).action).toBe('hold')
+  })
+
+  it('HOLDS exactly at the edge bin (not yet past it)', () => {
+    expect(decide({ ...base, activeBin: 110 }).action).toBe('hold')
+    expect(decide({ ...base, activeBin: 90 }).action).toBe('hold')
+  })
+
+  it('REPOSITIONS one bin past the upper edge', () => {
+    expect(decide({ ...base, activeBin: 111 }).action).toBe('reposition')
+  })
+
+  it('REPOSITIONS one bin past the lower edge', () => {
+    expect(decide({ ...base, activeBin: 89 }).action).toBe('reposition')
+  })
+
+  it('HOLDS when spot exited the range but cooldown is still active', () => {
+    expect(decide({ ...base, activeBin: 120, lastRebalanceTs: 99990 }).action).toBe('hold')
+  })
+
+  it('defers reposition when exited but active jumped suspiciously this poll', () => {
+    expect(decide({ ...base, activeBin: 130, lastObservedActiveBin: 100, manipulationJumpBins: 10 }).action).toBe('hold')
+  })
+})

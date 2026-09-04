@@ -23,6 +23,16 @@ export interface DecideInput {
   // same thing on every market regardless of bin width. Defaults to Infinity
   // (guard off) when omitted, preserving legacy callers.
   manipulationJumpBins?: number
+  // The bot's CURRENT deployed bin range (min/max HELD bin ids). When present,
+  // the rebalance trigger is EDGE-BASED: reposition only once the active (spot)
+  // bin leaves this range — i.e. one bin past the last edge bin — instead of on
+  // a small %-of-price drift from center. Far less aggressive: liquidity is only
+  // moved when price actually exits the bins we're providing, saving gas + LP
+  // churn during normal in-range oscillation. Null/omitted (no position, or
+  // price already outside the scan window) → falls back to the legacy
+  // center-drift threshold below.
+  heldMinBin?: number | null
+  heldMaxBin?: number | null
 }
 
 export interface DecideOutput {
@@ -70,23 +80,41 @@ export function decide(opts: DecideInput): DecideOutput {
     return { action: 'withdraw_filled', reason: 'bin(s) filled — withdraw and reset' }
   }
 
+  // ── Rebalance trigger ──────────────────────────────────────────────────
+  // PREFERRED: edge-based. Reposition only once the active (spot) bin exits the
+  // deployed range — one bin past the last edge bin. Rebalancing re-centers the
+  // range on the new active bin, so hysteresis is inherent (price must traverse
+  // a full half-width again before it can re-trigger — no ping-pong).
+  const haveRange = opts.heldMinBin != null && opts.heldMaxBin != null
+  const exitedRange = haveRange &&
+    (opts.activeBin < (opts.heldMinBin as number) || opts.activeBin > (opts.heldMaxBin as number))
+
+  // FALLBACK (range unknown — e.g. no positions in scan window): the legacy
+  // center-drift threshold, with ping-pong hysteresis against the last center.
   const drift = Math.abs(opts.activeBin - opts.currentCenter)
-  if (drift > opts.rebalanceBinsThreshold) {
-    // Hysteresis check: don't rebalance if the new target center is within
-    // `threshold` bins of the LAST rebalance center. This prevents a
-    // ping-pong storm when price oscillates inside `[oldCenter ± threshold]`.
-    if (opts.lastRebalanceCenter != null) {
+  const driftExceeded = !haveRange && drift > opts.rebalanceBinsThreshold
+
+  if (exitedRange || driftExceeded) {
+    if (driftExceeded && opts.lastRebalanceCenter != null) {
       const moveFromLast = Math.abs(opts.activeBin - opts.lastRebalanceCenter)
       if (moveFromLast <= opts.rebalanceBinsThreshold) {
         return { action: 'hold', reason: `drift ${drift} > threshold but move from last rebalance ${moveFromLast} ≤ threshold (hysteresis)` }
       }
     }
     if (suspiciousJump) {
-      return { action: 'hold', reason: `drift ${drift} > threshold but active jumped ${jump} > ${jumpLimit} bins this poll — deferring reposition to confirm (manipulation guard)` }
+      return { action: 'hold', reason: `price left range but active jumped ${jump} > ${jumpLimit} bins this poll — deferring reposition to confirm (manipulation guard)` }
     }
-    if (!cooldownExpired) return { action: 'hold', reason: 'drift exceeds threshold but cooldown active' }
-    return { action: 'reposition', reason: `drift ${drift} > threshold ${opts.rebalanceBinsThreshold}` }
+    if (!cooldownExpired) return { action: 'hold', reason: 'price left deployed range but cooldown active' }
+    const why = exitedRange
+      ? `spot bin ${opts.activeBin} left deployed range [${opts.heldMinBin}, ${opts.heldMaxBin}] — rebalance`
+      : `drift ${drift} > threshold ${opts.rebalanceBinsThreshold}`
+    return { action: 'reposition', reason: why }
   }
 
-  return { action: 'hold', reason: 'within tolerance' }
+  return {
+    action: 'hold',
+    reason: haveRange
+      ? `spot bin ${opts.activeBin} within deployed range [${opts.heldMinBin}, ${opts.heldMaxBin}]`
+      : 'within tolerance',
+  }
 }
